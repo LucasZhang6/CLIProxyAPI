@@ -1,6 +1,7 @@
 package management
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -8,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -19,9 +21,27 @@ import (
 )
 
 const (
-	latestReleaseURL       = "https://api.github.com/repos/router-for-me/CLIProxyAPI/releases/latest"
-	latestReleaseUserAgent = "CLIProxyAPI"
+	defaultLatestReleaseURL = "https://api.github.com/repos/router-for-me/CLIProxyAPI/releases/latest"
+	latestReleaseURL        = defaultLatestReleaseURL
+	latestReleaseUserAgent  = "CLIProxyAPI"
+	latestVersionCacheTTL   = 15 * time.Minute
 )
+
+type latestVersionCache struct {
+	mu         sync.Mutex
+	version    string
+	fetchedAt  time.Time
+	inflight   *latestVersionLookup
+	refreshing bool
+	endpoint   string
+	nowFunc    func() time.Time
+}
+
+type latestVersionLookup struct {
+	done    chan struct{}
+	version string
+	err     error
+}
 
 func (h *Handler) GetConfig(c *gin.Context) {
 	if h == nil || h.cfg == nil {
@@ -59,57 +79,154 @@ func setLatestReleaseRequestHeaders(req *http.Request) {
 }
 
 // GetLatestVersion returns the latest release version from GitHub without downloading assets.
+// Fresh cache hits return immediately. Stale values are served while a background refresh runs.
 func (h *Handler) GetLatestVersion(c *gin.Context) {
-	client := &http.Client{Timeout: 10 * time.Second}
-	proxyURL := ""
-	if h != nil && h.cfg != nil {
-		proxyURL = strings.TrimSpace(h.cfg.ProxyURL)
-	}
-	if proxyURL != "" {
-		sdkCfg := &sdkconfig.SDKConfig{ProxyURL: proxyURL}
-		util.SetProxy(sdkCfg, client)
-	}
-
-	req, err := http.NewRequestWithContext(c.Request.Context(), http.MethodGet, latestReleaseURL, nil)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "request_create_failed", "message": err.Error()})
+	if h == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "unavailable"})
 		return
 	}
-	setLatestReleaseRequestHeaders(req)
-
-	resp, err := client.Do(req)
+	proxyURL := ""
+	if h.cfg != nil {
+		proxyURL = strings.TrimSpace(h.cfg.ProxyURL)
+	}
+	if version, stale := h.latestVersion.cached(); version != "" {
+		c.JSON(http.StatusOK, gin.H{"latest-version": version})
+		if stale {
+			h.latestVersion.refreshAsync(proxyURL, h.fetchLatestVersion)
+		}
+		return
+	}
+	version, err := h.latestVersion.fetchShared(c.Request.Context(), proxyURL, h.fetchLatestVersion)
 	if err != nil {
 		c.JSON(http.StatusBadGateway, gin.H{"error": "request_failed", "message": err.Error()})
 		return
+	}
+	c.JSON(http.StatusOK, gin.H{"latest-version": version})
+}
+
+func (cache *latestVersionCache) now() time.Time {
+	if cache != nil && cache.nowFunc != nil {
+		return cache.nowFunc()
+	}
+	return time.Now()
+}
+
+func (cache *latestVersionCache) endpointURL() string {
+	if cache != nil && strings.TrimSpace(cache.endpoint) != "" {
+		return strings.TrimSpace(cache.endpoint)
+	}
+	return defaultLatestReleaseURL
+}
+
+func (cache *latestVersionCache) cached() (string, bool) {
+	if cache == nil {
+		return "", false
+	}
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
+	if cache.version == "" {
+		return "", false
+	}
+	return cache.version, cache.now().Sub(cache.fetchedAt) >= latestVersionCacheTTL
+}
+
+func (cache *latestVersionCache) fetchShared(ctx context.Context, proxyURL string, fetch func(context.Context, string) (string, error)) (string, error) {
+	if cache == nil {
+		return "", fmt.Errorf("latest version cache is nil")
+	}
+	cache.mu.Lock()
+	if cache.version != "" && cache.now().Sub(cache.fetchedAt) < latestVersionCacheTTL {
+		version := cache.version
+		cache.mu.Unlock()
+		return version, nil
+	}
+	if pending := cache.inflight; pending != nil {
+		cache.mu.Unlock()
+		select {
+		case <-pending.done:
+			return pending.version, pending.err
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	}
+	lookup := &latestVersionLookup{done: make(chan struct{})}
+	cache.inflight = lookup
+	cache.mu.Unlock()
+
+	version, err := fetch(ctx, proxyURL)
+	cache.mu.Lock()
+	if err == nil && strings.TrimSpace(version) != "" {
+		cache.version = strings.TrimSpace(version)
+		cache.fetchedAt = cache.now()
+	}
+	lookup.version = cache.version
+	lookup.err = err
+	cache.inflight = nil
+	close(lookup.done)
+	cache.mu.Unlock()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(version), nil
+}
+
+func (cache *latestVersionCache) refreshAsync(proxyURL string, fetch func(context.Context, string) (string, error)) {
+	if cache == nil {
+		return
+	}
+	cache.mu.Lock()
+	if cache.refreshing || cache.inflight != nil {
+		cache.mu.Unlock()
+		return
+	}
+	cache.refreshing = true
+	cache.mu.Unlock()
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_, _ = cache.fetchShared(ctx, proxyURL, fetch)
+		cache.mu.Lock()
+		cache.refreshing = false
+		cache.mu.Unlock()
+	}()
+}
+
+func (h *Handler) fetchLatestVersion(ctx context.Context, proxyURL string) (string, error) {
+	client := &http.Client{Timeout: 10 * time.Second}
+	if strings.TrimSpace(proxyURL) != "" {
+		sdkCfg := &sdkconfig.SDKConfig{ProxyURL: proxyURL}
+		util.SetProxy(sdkCfg, client)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, h.latestVersion.endpointURL(), nil)
+	if err != nil {
+		return "", err
+	}
+	setLatestReleaseRequestHeaders(req)
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
 	}
 	defer func() {
 		if errClose := resp.Body.Close(); errClose != nil {
 			log.WithError(errClose).Debug("failed to close latest version response body")
 		}
 	}()
-
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		c.JSON(http.StatusBadGateway, gin.H{"error": "unexpected_status", "message": fmt.Sprintf("status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))})
-		return
+		return "", fmt.Errorf("status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
-
 	var info releaseInfo
 	if errDecode := json.NewDecoder(resp.Body).Decode(&info); errDecode != nil {
-		c.JSON(http.StatusBadGateway, gin.H{"error": "decode_failed", "message": errDecode.Error()})
-		return
+		return "", errDecode
 	}
-
 	version := strings.TrimSpace(info.TagName)
 	if version == "" {
 		version = strings.TrimSpace(info.Name)
 	}
 	if version == "" {
-		c.JSON(http.StatusBadGateway, gin.H{"error": "invalid_response", "message": "missing release version"})
-		return
+		return "", fmt.Errorf("missing release version")
 	}
-
-	c.JSON(http.StatusOK, gin.H{"latest-version": version})
+	return version, nil
 }
 
 func WriteConfig(path string, data []byte) error {

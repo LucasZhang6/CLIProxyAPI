@@ -1,7 +1,9 @@
 package api
 
 import (
+	"crypto/sha256"
 	_ "embed"
+	"encoding/hex"
 	"net/http"
 	"path/filepath"
 
@@ -12,6 +14,11 @@ import (
 //go:embed account_bridge.js
 var accountBridge []byte
 
+func accountBridgeURL() string {
+	sum := sha256.Sum256(accountBridge)
+	return "/account-bridge.js?v=" + hex.EncodeToString(sum[:8])
+}
+
 func (s *Server) serveAccountPortal(c *gin.Context) {
 	if s.cfg == nil || s.cfg.Home.Enabled || s.cfg.RemoteManagement.DisableControlPanel {
 		c.AbortWithStatus(http.StatusNotFound)
@@ -21,6 +28,5 @@ func (s *Server) serveAccountPortal(c *gin.Context) {
 }
 
 func (s *Server) serveAccountBridge(c *gin.Context) {
-	c.Header("Cache-Control", "no-cache")
-	c.Data(http.StatusOK, "application/javascript; charset=utf-8", accountBridge)
+	s.serveCachedUIBytes(c, "account-bridge.js", "application/javascript; charset=utf-8", accountBridge)
 }

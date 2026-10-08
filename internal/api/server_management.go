@@ -344,7 +344,7 @@ func (s *Server) serveManagementControlPanel(c *gin.Context) {
 			return
 		}
 	}
-	s.serveCachedUIAsset(c, filePath, "text/html; charset=utf-8", injectManagementBillingNav)
+	s.serveCachedUIAsset(c, filePath, "text/html; charset=utf-8", s.transformManagementHTML)
 }
 
 func injectManagementBillingNav(payload []byte) []byte {
@@ -361,7 +361,7 @@ func injectManagementBillingNav(payload []byte) []byte {
 		}
 	}
 	if !strings.Contains(html, `id="cpa-account-bridge"`) {
-		const accountScript = `<script id="cpa-account-bridge" src="/account-bridge.js"></script>`
+		accountScript := `<script id="cpa-account-bridge" src="` + accountBridgeURL() + `"></script>`
 		if idx := strings.Index(strings.ToLower(html), "<head>"); idx >= 0 {
 			idx += len("<head>")
 			html = html[:idx] + accountScript + html[idx:]

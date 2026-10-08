@@ -496,7 +496,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, pickOpts, tried)
 		if errPick != nil {
 			if shouldReturnLastErrorOnPickFailure(homeMode, lastErr, errPick) {
-				return cliproxyexecutor.Response{}, preferredExecutionAttemptError(lastErr, upstreamErr)
+				return cliproxyexecutor.Response{}, m.preferShortWindowCooldown(preferredExecutionAttemptError(lastErr, upstreamErr), errPick, providers, routeModel)
 			}
 			return cliproxyexecutor.Response{}, errPick
 		}
@@ -709,7 +709,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, pickOpts, tried)
 		if errPick != nil {
 			if shouldReturnLastErrorOnPickFailure(homeMode, lastErr, errPick) {
-				return cliproxyexecutor.Response{}, preferredExecutionAttemptError(lastErr, upstreamErr)
+				return cliproxyexecutor.Response{}, m.preferShortWindowCooldown(preferredExecutionAttemptError(lastErr, upstreamErr), errPick, providers, routeModel)
 			}
 			return cliproxyexecutor.Response{}, errPick
 		}
@@ -961,7 +961,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 				if homeMode {
 					return nil, markHomeRetryRoundExhausted(preferredErr, roundTiming.RetryAfter(), isHomeNextRoundImmediatelyAvailable(errPick))
 				}
-				return nil, preferredErr
+				return nil, m.preferShortWindowCooldown(preferredErr, errPick, providers, routeModel)
 			}
 			return nil, errPick
 		}

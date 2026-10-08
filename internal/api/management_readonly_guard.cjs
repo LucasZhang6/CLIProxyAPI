@@ -26,7 +26,7 @@ function permitted(method,path){
  if(path.startsWith(prefix+'/'))return safeRead(path);
  if(path.startsWith('/v0/'))return false;
  return ['/accounts.html','/management.html','/billing.html','/account-bridge.js',
- '/billing-token-panel.js','/favicon.ico','/v1/models'].includes(path)||path.startsWith('/assets/');
+ '/billing-token-panel.js','/favicon.ico','/v1/models'].includes(path)||path.startsWith('/assets/')||path.startsWith('/management.assets/');
 }
 async function installReadOnlyGuard(context,base,onBlocked=()=>{}){
  const origin=new URL(base).origin;

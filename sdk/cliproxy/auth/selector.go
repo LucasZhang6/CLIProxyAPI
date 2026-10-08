@@ -808,7 +808,7 @@ func weeklyRemainingPercentFromSignals(signals map[string]string) (float64, bool
 	if len(signals) == 0 {
 		return 0, false
 	}
-	if value, ok := signalValueCaseInsensitive(signals, "weekly_quota_remaining_percent"); ok {
+	if value, ok := signalValueCaseInsensitive(signals, WeeklyQuotaRemainingPercentSignal); ok {
 		if remaining, okParse := parsePercentSignal(value); okParse {
 			return clampPercent(remaining), true
 		}
@@ -1065,7 +1065,7 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 	if exp, ok := auth.AccessTokenExpirationTime(); ok && !exp.IsZero() && !exp.After(now) {
 		return true, blockReasonOther, time.Time{}
 	}
-	if auth.Quota.Exceeded && auth.Quota.Reason == "credential_quota" && auth.Quota.NextRecoverAt.After(now) {
+	if auth.Quota.Exceeded && credentialWideQuotaReason(auth.Quota.Reason) && auth.Quota.NextRecoverAt.After(now) {
 		return true, blockReasonCooldown, auth.Quota.NextRecoverAt
 	}
 	if model != "" {

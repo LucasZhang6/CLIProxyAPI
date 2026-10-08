@@ -12,6 +12,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/andybalholm/brotli"
 )
 
 func TestManagementUIAssetCacheGzipDecodedEqualsInjectedIdentity(t *testing.T) {
@@ -24,8 +26,8 @@ func TestManagementUIAssetCacheGzipDecodedEqualsInjectedIdentity(t *testing.T) {
 	if identity.Code != http.StatusOK {
 		t.Fatalf("identity status = %d, want %d body=%s", identity.Code, http.StatusOK, identity.Body.String())
 	}
-	if got := identity.Header().Get("Cache-Control"); got != "private, no-cache" {
-		t.Fatalf("Cache-Control = %q, want private, no-cache", got)
+	if got := identity.Header().Get("Cache-Control"); got != uiAssetCacheControl {
+		t.Fatalf("Cache-Control = %q, want %q", got, uiAssetCacheControl)
 	}
 	if got := identity.Header().Get("Vary"); got != "Accept-Encoding" {
 		t.Fatalf("Vary = %q, want Accept-Encoding", got)
@@ -64,28 +66,31 @@ func TestManagementUIAssetCacheAcceptEncodingQHandling(t *testing.T) {
 	server := newTestServer(t)
 
 	for _, tc := range []struct {
-		name       string
-		header     string
-		wantGzip   bool
-		wantBody   string
-		decodeBody bool
+		name         string
+		header       string
+		wantEncoding string
+		wantBody     string
 	}{
 		{name: "gzip q zero disables gzip", header: "gzip;q=0", wantBody: `console.log("billing");`},
-		{name: "explicit gzip q zero beats wildcard", header: "br, gzip;q=0, *;q=1", wantBody: `console.log("billing");`},
-		{name: "wildcard permits gzip", header: "br;q=1, *;q=0.5", wantGzip: true, wantBody: `console.log("billing");`, decodeBody: true},
-		{name: "gzip positive q permits gzip", header: "gzip;q=0.2", wantGzip: true, wantBody: `console.log("billing");`, decodeBody: true},
+		{name: "explicit gzip q zero still allows brotli", header: "br, gzip;q=0, *;q=1", wantEncoding: "br", wantBody: `console.log("billing");`},
+		{name: "brotli preferred over wildcard gzip", header: "br;q=1, *;q=0.5", wantEncoding: "br", wantBody: `console.log("billing");`},
+		{name: "gzip positive q permits gzip", header: "gzip;q=0.2", wantEncoding: "gzip", wantBody: `console.log("billing");`},
+		{name: "brotli preferred when both accepted", header: "gzip, br", wantEncoding: "br", wantBody: `console.log("billing");`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			rr := performUIAssetRequest(t, server, http.MethodGet, "/billing-token-panel.js", map[string]string{"Accept-Encoding": tc.header})
 			if rr.Code != http.StatusOK {
 				t.Fatalf("status = %d, want %d body=%s", rr.Code, http.StatusOK, rr.Body.String())
 			}
-			if got := rr.Header().Get("Content-Encoding"); (got == "gzip") != tc.wantGzip {
-				t.Fatalf("Content-Encoding = %q, want gzip=%v", got, tc.wantGzip)
+			if got := rr.Header().Get("Content-Encoding"); got != tc.wantEncoding {
+				t.Fatalf("Content-Encoding = %q, want %q", got, tc.wantEncoding)
 			}
 			body := rr.Body.Bytes()
-			if tc.decodeBody {
+			switch tc.wantEncoding {
+			case "gzip":
 				body = gunzipTestBody(t, body)
+			case "br":
+				body = unbrotliTestBody(t, body)
 			}
 			if string(body) != tc.wantBody {
 				t.Fatalf("body = %q, want %q", body, tc.wantBody)
@@ -240,6 +245,30 @@ func TestManagementUIAssetCacheConcurrentRequests(t *testing.T) {
 	}
 }
 
+func TestAccountBridgeUsesSharedUICacheHeaders(t *testing.T) {
+	staticDir := t.TempDir()
+	t.Setenv("MANAGEMENT_STATIC_PATH", staticDir)
+	server := newTestServer(t)
+
+	identity := performUIAssetRequest(t, server, http.MethodGet, "/account-bridge.js", nil)
+	if identity.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", identity.Code, identity.Body.String())
+	}
+	if got := identity.Header().Get("Cache-Control"); got != uiAssetCacheControl {
+		t.Fatalf("Cache-Control=%q", got)
+	}
+	if identity.Header().Get("ETag") == "" {
+		t.Fatal("missing ETag")
+	}
+	br := performUIAssetRequest(t, server, http.MethodGet, "/account-bridge.js", map[string]string{"Accept-Encoding": "br"})
+	if br.Header().Get("Content-Encoding") != "br" {
+		t.Fatalf("Content-Encoding=%q, want br", br.Header().Get("Content-Encoding"))
+	}
+	if string(unbrotliTestBody(t, br.Body.Bytes())) != string(identity.Body.Bytes()) {
+		t.Fatal("brotli account-bridge body mismatch")
+	}
+}
+
 func TestManagementUIAssetCacheDisabledControlPanelPreserved(t *testing.T) {
 	staticDir := t.TempDir()
 	t.Setenv("MANAGEMENT_STATIC_PATH", staticDir)
@@ -275,6 +304,15 @@ func writeUIAsset(t *testing.T, path string, body string) {
 	// Give filesystems with coarse timestamp behavior a stable timestamp for tests that set it explicitly later.
 	now := time.Now().Add(-time.Second)
 	_ = os.Chtimes(path, now, now)
+}
+
+func unbrotliTestBody(t *testing.T, body []byte) []byte {
+	t.Helper()
+	decoded, err := io.ReadAll(brotli.NewReader(bytes.NewReader(body)))
+	if err != nil {
+		t.Fatalf("read brotli body: %v", err)
+	}
+	return decoded
 }
 
 func gunzipTestBody(t *testing.T, body []byte) []byte {

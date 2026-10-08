@@ -759,6 +759,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 
 	var authSnapshot *Auth
 	cooldownStateChanged := false
+	shortWindowCredential := false
 	now := time.Now()
 
 	m.mu.Lock()
@@ -866,6 +867,9 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 								state.NextRetryAfter = next
 							}
 						case 429:
+							if markShortWindowRateLimit(auth, result.Error, result.RetryAfter, now, disableCooling) {
+								break
+							}
 							var next time.Time
 							backoffLevel := state.Quota.BackoffLevel
 							if !disableCooling {
@@ -956,6 +960,9 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 				}
 				applyAuthFailureState(auth, result.Error, result.RetryAfter, now, disableCooling)
 			}
+			if auth.Quota.Exceeded && auth.Quota.Reason == shortRateLimitQuotaReason && auth.Quota.NextRecoverAt.After(now) {
+				shortWindowCredential = true
+			}
 		}
 
 		auth.Generation++
@@ -978,13 +985,13 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	m.mu.Unlock()
 	if m.scheduler != nil && authSnapshot != nil {
 		var targetModels []string
-		if !result.CredentialScope && modelKey != "" {
+		if !result.CredentialScope && !shortWindowCredential && modelKey != "" {
 			targetModels = append(targetModels, modelKey)
 			if routeKey := canonicalModelKey(result.RouteModel); routeKey != "" && routeKey != modelKey {
 				targetModels = append(targetModels, routeKey)
 			}
 		}
-		m.scheduler.upsertAuthResult(authSnapshot, targetModels, result.CredentialScope)
+		m.scheduler.upsertAuthResult(authSnapshot, targetModels, result.CredentialScope || shortWindowCredential)
 	}
 	if authSnapshot != nil && cooldownStateChanged {
 		m.persistCooldownStates(context.Background())
@@ -1282,8 +1289,11 @@ func updateAggregatedAvailability(auth *Auth, now time.Time) {
 	if auth == nil {
 		return
 	}
-	if auth.Quota.Exceeded && auth.Quota.Reason == "credential_quota" && auth.Quota.NextRecoverAt.After(now) {
+	if auth.Quota.Exceeded && credentialWideQuotaReason(auth.Quota.Reason) && auth.Quota.NextRecoverAt.After(now) {
 		auth.Unavailable = true
+		if auth.Quota.Reason == shortRateLimitQuotaReason && auth.NextRetryAfter.Before(auth.Quota.NextRecoverAt) {
+			auth.NextRetryAfter = auth.Quota.NextRecoverAt
+		}
 		return
 	}
 	if len(auth.ModelStates) == 0 {
@@ -2217,6 +2227,9 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 				auth.NextRetryAfter = now.Add(12 * time.Hour)
 			}
 		case 429:
+			if markShortWindowRateLimit(auth, resultErr, retryAfter, now, disableCooling) {
+				break
+			}
 			auth.StatusMessage = "quota exhausted"
 			auth.Quota.Exceeded = true
 			auth.Quota.Reason = "quota"

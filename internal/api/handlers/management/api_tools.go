@@ -231,6 +231,7 @@ func (h *Handler) APICall(c *gin.Context) {
 		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to read response"})
 		return
 	}
+	h.noteCodexWhamUsage(auth, parsedURL, resp.StatusCode, respBody)
 
 	c.JSON(http.StatusOK, apiCallResponse{
 		StatusCode: resp.StatusCode,
@@ -834,6 +835,9 @@ func (h *Handler) authByIndex(authIndex string) *coreauth.Auth {
 }
 
 func (h *Handler) apiCallTransport(auth *coreauth.Auth, requestProxyURL string) http.RoundTripper {
+	if h != nil && h.apiCallTransportForTest != nil {
+		return h.apiCallTransportForTest
+	}
 	if proxyStr := strings.TrimSpace(requestProxyURL); proxyStr != "" {
 		if transport := buildProxyTransport(proxyStr); transport != nil {
 			return transport

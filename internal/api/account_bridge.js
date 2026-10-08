@@ -7,11 +7,13 @@
   try { session = JSON.parse(localStorage.getItem('cpa-account-session') || 'null'); } catch (_) {}
   function redirectLegacyLogin() {
     if (!/\/management\.html$/i.test(location.pathname)) return false;
-    var loginRoute = /^#\/?login(?:[/?]|$)/i.test(location.hash);
     // The upstream app briefly visits /login while restoreSession authenticates.
     // Only an actual logout (isLoggedIn removed) should revoke the account token.
+    // Never hide the whole document for a signed-in session: HashRouter often
+    // changes #/login → #/ via history.replaceState without hashchange, which
+    // used to leave visibility:hidden stuck after the faster cached bundle load.
     if (session && session.token && localStorage.getItem('isLoggedIn') === 'true') {
-      document.documentElement.style.visibility = loginRoute ? 'hidden' : '';
+      document.documentElement.style.visibility = '';
       return false;
     }
     // Retire the shared-key web login, including cached legacy login state.
@@ -88,6 +90,17 @@
     }).observe(document.body, { childList: true, subtree: true });
     window.addEventListener('hashchange', applyRole);
     window.addEventListener('popstate', applyRole);
+    if (typeof history !== 'undefined') {
+      ['pushState', 'replaceState'].forEach(function (method) {
+        var orig = history[method];
+        if (typeof orig !== 'function') return;
+        history[method] = function () {
+          var ret = orig.apply(this, arguments);
+          applyRole();
+          return ret;
+        };
+      });
+    }
     window.addEventListener('storage', function (event) {
       if (event.key !== null && event.key !== 'cpa-account-session') return;
       var next;

@@ -57,7 +57,7 @@ test('intermediate login route during session restoration does not revoke the to
  const {sandbox,storage,calls}=routeSandbox('#/login',{token:'account-token',loggedIn:true,user:{role:'user'}},false);
  vm.runInNewContext(code,sandbox);
  assert.equal(sandbox.location.redirect,undefined);
- assert.equal(sandbox.document.documentElement.style.visibility,'hidden');
+ assert.equal(sandbox.document.documentElement.style.visibility,'');
  assert.equal(calls.length,0);
  assert.ok(storage.has('cpa-account-session'));
 });

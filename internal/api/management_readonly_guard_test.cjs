@@ -8,6 +8,7 @@ test('unsafe GETs, plugin resources and all platform writes fail closed',()=>{
  for(const p of ['/v0/management/get-auth-status','/v0/management/oauth-callback','/v0/management/codex-auth-url','/v0/management/plugin-start','/v0/resource/plugins/test/run','/callback','/unknown'])assert.equal(permitted('GET',p),false,p);
  for(const verb of ['POST','PUT','PATCH','DELETE'])for(const p of ['/config.yaml','/auth-files','/accounts/password','/accounts/users','/plugin-store/test/install','/billing/api-tokens/test'])assert.equal(permitted(verb,'/v0/management'+p),false);
  assert.equal(permitted('GET','/v0/management/accounts/login'),false);
+ assert.ok(permitted('GET','/management.assets/0123456789abcdef.js'));
  assert.equal(safeRead('/v0/management//config'),false);
 });
 test('guard blocks off-origin requests and returns explicit no-write response',async()=>{

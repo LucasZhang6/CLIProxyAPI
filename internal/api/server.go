@@ -96,8 +96,9 @@ type Server struct {
 	managementRoutesEnabled atomic.Bool
 
 	// uiAssetCache stores the small set of transformed management UI assets per server.
-	uiAssetCache     *uiAssetCache
-	uiAssetCacheOnce sync.Once
+	uiAssetCache      *uiAssetCache
+	uiAssetCacheOnce  sync.Once
+	managementBundles managementBundleStore
 
 	// envManagementSecret indicates whether MANAGEMENT_PASSWORD is configured.
 	envManagementSecret bool
@@ -109,6 +110,8 @@ type Server struct {
 	keepAliveOnTimeout func()
 	keepAliveHeartbeat chan struct{}
 	keepAliveStop      chan struct{}
+
+	codexQuotaProbeCancel context.CancelFunc
 
 	exampleAPIKeySafeModeEnabled bool
 	exampleAPIKeySafeModeActive  atomic.Bool
@@ -197,7 +200,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 		wsRoutes:            make(map[string]struct{}),
 		pluginHost:          optionState.pluginHost,
 		billingService:      billingService,
-		uiAssetCache:        newUIAssetCache(3),
+		uiAssetCache:        newUIAssetCache(8),
 
 		exampleAPIKeySafeModeEnabled: optionState.exampleAPIKeySafeMode,
 	}
@@ -292,6 +295,13 @@ func (s *Server) Handler() http.Handler {
 func (s *Server) Start() error {
 	if s == nil || s.server == nil {
 		return fmt.Errorf("failed to start HTTP server: server not initialized")
+	}
+
+	probeCtx, probeCancel := context.WithCancel(context.Background())
+	s.codexQuotaProbeCancel = probeCancel
+	defer probeCancel()
+	if s.mgmt != nil {
+		s.mgmt.StartCodexQuotaProbe(probeCtx)
 	}
 
 	addr := s.server.Addr
@@ -398,6 +408,10 @@ func (s *Server) Start() error {
 //   - error: An error if the server fails to stop
 func (s *Server) Stop(ctx context.Context) error {
 	log.Debug("Stopping API server...")
+
+	if s.codexQuotaProbeCancel != nil {
+		s.codexQuotaProbeCancel()
+	}
 
 	if s.keepAliveEnabled {
 		select {

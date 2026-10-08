@@ -65,6 +65,16 @@ type Handler struct {
 	pluginStoreHTTPClient   pluginstore.HTTPDoer
 	pluginStoreRateLimiter  *pluginstore.GitHubRateLimiter
 	pluginReleases          pluginReleaseCache
+	latestVersion           latestVersionCache
+
+	codexQuotaProbeOnce    sync.Once
+	codexQuotaProbeMu      sync.Mutex
+	codexQuotaProbeRunning bool
+	// apiCallTransportForTest replaces proxy selection in APICall. Tests use it
+	// to answer a chatgpt.com quota URL without a network dial.
+	apiCallTransportForTest http.RoundTripper
+	// codexQuotaProbeDo replaces the probe HTTP call in tests.
+	codexQuotaProbeDo func(*http.Request) (*http.Response, error)
 }
 
 type configReloadSnapshot struct {
