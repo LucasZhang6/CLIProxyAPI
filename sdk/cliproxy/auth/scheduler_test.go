@@ -180,6 +180,28 @@ func TestSchedulerPick_RoundRobinHighestPriority(t *testing.T) {
 	}
 }
 
+func TestSchedulerPick_QuotaAwareUsesConfiguredSelector(t *testing.T) {
+	t.Parallel()
+
+	scheduler := newSchedulerForTest(
+		&QuotaAwareSelector{WeeklyRemainingMinPercent: 20, SpreadBandPercent: 10},
+		codexQuotaAuth("below-band", 70),
+		codexQuotaAuth("b", 95),
+		codexQuotaAuth("a", 99),
+	)
+
+	want := []string{"a", "b", "a", "b"}
+	for index, wantID := range want {
+		got, errPick := scheduler.pickSingle(context.Background(), "codex", "", cliproxyexecutor.Options{}, nil)
+		if errPick != nil {
+			t.Fatalf("pickSingle() #%d error = %v", index, errPick)
+		}
+		if got == nil || got.ID != wantID {
+			t.Fatalf("pickSingle() #%d auth = %#v, want %s", index, got, wantID)
+		}
+	}
+}
+
 func TestSchedulerPick_WeightedRoundRobin(t *testing.T) {
 	t.Parallel()
 

@@ -2486,3 +2486,155 @@ func TestManager_MarkResult_RequestFaultBodyDoesNotCooldownModelOrAuth(t *testin
 		t.Fatalf("expected real 401 authentication error to set model cooldown state, got %#v", state)
 	}
 }
+
+func TestManager_FailoverRejectionIsNotARequestFailure(t *testing.T) {
+	const provider = "openai-compatibility"
+	const model = "failover-stat-model"
+	overload := &Error{HTTPStatus: http.StatusServiceUnavailable, Message: "Our servers are currently overloaded. Please try again later.", Retryable: true}
+
+	registerFailoverPair := func(t *testing.T, executor *authFallbackExecutor) (*Manager, *Auth, *Auth) {
+		t.Helper()
+		m := NewManager(nil, nil, nil)
+		m.SetRetryConfig(0, 0, 5)
+		m.RegisterExecutor(executor)
+		rejected := &Auth{ID: "aa-failover-rejected", Provider: provider}
+		accepted := &Auth{ID: "bb-failover-accepted", Provider: provider}
+		reg := registry.GetGlobalRegistry()
+		models := []*registry.ModelInfo{{ID: model}}
+		reg.RegisterClient(rejected.ID, provider, models)
+		reg.RegisterClient(accepted.ID, provider, models)
+		t.Cleanup(func() {
+			reg.UnregisterClient(rejected.ID)
+			reg.UnregisterClient(accepted.ID)
+		})
+		if _, errRegister := m.Register(WithSkipPersist(context.Background()), rejected); errRegister != nil {
+			t.Fatalf("register rejected auth: %v", errRegister)
+		}
+		if _, errRegister := m.Register(WithSkipPersist(context.Background()), accepted); errRegister != nil {
+			t.Fatalf("register accepted auth: %v", errRegister)
+		}
+		return m, rejected, accepted
+	}
+
+	t.Run("rescued request counts one success", func(t *testing.T) {
+		executor := &authFallbackExecutor{
+			id:            provider,
+			executeErrors: map[string]error{"aa-failover-rejected": overload},
+		}
+		m, rejected, accepted := registerFailoverPair(t, executor)
+		resp, errExecute := m.Execute(context.Background(), []string{provider}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+		if errExecute != nil {
+			t.Fatalf("expected failover to succeed, got %v", errExecute)
+		}
+		if got := string(resp.Payload); got != accepted.ID {
+			t.Fatalf("served by %q, want %q", got, accepted.ID)
+		}
+		updatedRejected, _ := m.GetByID(rejected.ID)
+		updatedAccepted, _ := m.GetByID(accepted.ID)
+		if updatedRejected.Failed != 0 || updatedRejected.Success != 0 {
+			t.Fatalf("rejected auth counters = success %d failed %d, want 0/0", updatedRejected.Success, updatedRejected.Failed)
+		}
+		state := updatedRejected.ModelStates[model]
+		if state == nil || !state.Unavailable {
+			t.Fatalf("expected rejected auth to stay cooled, got %#v", state)
+		}
+		if updatedAccepted.Success != 1 || updatedAccepted.Failed != 0 {
+			t.Fatalf("accepted auth counters = success %d failed %d, want 1/0", updatedAccepted.Success, updatedAccepted.Failed)
+		}
+	})
+
+	t.Run("exhausted request counts one failure", func(t *testing.T) {
+		executor := &authFallbackExecutor{
+			id: provider,
+			executeErrors: map[string]error{
+				"aa-failover-rejected": overload,
+				"bb-failover-accepted": overload,
+			},
+		}
+		m, rejected, accepted := registerFailoverPair(t, executor)
+		if _, errExecute := m.Execute(context.Background(), []string{provider}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{}); errExecute == nil {
+			t.Fatal("expected every credential to fail")
+		}
+		updatedRejected, _ := m.GetByID(rejected.ID)
+		updatedAccepted, _ := m.GetByID(accepted.ID)
+		if updatedRejected.Failed != 0 {
+			t.Fatalf("earlier rejection counted as failed %d, want 0", updatedRejected.Failed)
+		}
+		if updatedAccepted.Failed != 1 || updatedAccepted.Success != 0 {
+			t.Fatalf("final auth counters = success %d failed %d, want 0/1", updatedAccepted.Success, updatedAccepted.Failed)
+		}
+		if total := updatedRejected.Failed + updatedAccepted.Failed; total != 1 {
+			t.Fatalf("request failure total = %d, want 1", total)
+		}
+	})
+
+	t.Run("rescued stream counts one success", func(t *testing.T) {
+		executor := &authFallbackExecutor{
+			id: provider,
+			streamFirstErrors: map[string]error{
+				"aa-failover-rejected": overload,
+			},
+		}
+		m, rejected, accepted := registerFailoverPair(t, executor)
+		result, errStream := m.ExecuteStream(context.Background(), []string{provider}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{Stream: true})
+		if errStream != nil {
+			t.Fatalf("expected failover stream, got %v", errStream)
+		}
+		var payload []byte
+		for chunk := range result.Chunks {
+			if chunk.Err != nil {
+				t.Fatalf("stream error: %v", chunk.Err)
+			}
+			payload = append(payload, chunk.Payload...)
+		}
+		if string(payload) != accepted.ID {
+			t.Fatalf("stream payload = %q, want %q", payload, accepted.ID)
+		}
+		updatedRejected, _ := m.GetByID(rejected.ID)
+		updatedAccepted, _ := m.GetByID(accepted.ID)
+		if updatedRejected.Failed != 0 || updatedRejected.Success != 0 {
+			t.Fatalf("rejected stream counters = success %d failed %d, want 0/0", updatedRejected.Success, updatedRejected.Failed)
+		}
+		state := updatedRejected.ModelStates[model]
+		if state == nil || !state.Unavailable {
+			t.Fatalf("expected rejected stream auth to stay cooled, got %#v", state)
+		}
+		if updatedAccepted.Success != 1 || updatedAccepted.Failed != 0 {
+			t.Fatalf("accepted stream counters = success %d failed %d, want 1/0", updatedAccepted.Success, updatedAccepted.Failed)
+		}
+	})
+
+	t.Run("stream failover counts the committed outcome", func(t *testing.T) {
+		executor := &authFallbackExecutor{
+			id: provider,
+			streamFirstErrors: map[string]error{
+				"aa-failover-rejected": overload,
+			},
+			streamTailErrors: map[string]error{
+				"bb-failover-accepted": overload,
+			},
+		}
+		m, rejected, accepted := registerFailoverPair(t, executor)
+		result, errStream := m.ExecuteStream(context.Background(), []string{provider}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{Stream: true})
+		if errStream != nil {
+			t.Fatalf("expected a committed stream, got %v", errStream)
+		}
+		var streamErr error
+		for chunk := range result.Chunks {
+			if chunk.Err != nil {
+				streamErr = chunk.Err
+			}
+		}
+		if streamErr == nil {
+			t.Fatal("expected the committed stream to fail")
+		}
+		updatedRejected, _ := m.GetByID(rejected.ID)
+		updatedAccepted, _ := m.GetByID(accepted.ID)
+		if updatedRejected.Failed != 0 || updatedRejected.Success != 0 {
+			t.Fatalf("bootstrap rejection counters = success %d failed %d, want 0/0", updatedRejected.Success, updatedRejected.Failed)
+		}
+		if updatedAccepted.Failed != 1 || updatedAccepted.Success != 0 {
+			t.Fatalf("committed stream counters = success %d failed %d, want 0/1", updatedAccepted.Success, updatedAccepted.Failed)
+		}
+	})
+}

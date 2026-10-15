@@ -137,6 +137,72 @@ func TestQuotaAwareSelectorPick_AllBelowThresholdFallsBackToHighestRemaining(t *
 	}
 }
 
+func TestQuotaAwareSelectorPick_SpreadBandRotatesNearTopCandidates(t *testing.T) {
+	t.Parallel()
+
+	selector := &QuotaAwareSelector{WeeklyRemainingMinPercent: 20, SpreadBandPercent: 10}
+	auths := []*Auth{
+		codexQuotaAuth("c", 90),
+		codexQuotaAuth("below-band", 80),
+		codexQuotaAuth("a", 100),
+		codexQuotaAuth("b", 96),
+	}
+
+	want := []string{"a", "b", "c", "a", "b", "c"}
+	for index, wantID := range want {
+		got, err := selector.Pick(context.Background(), "codex", "gpt-5.5", cliproxyexecutor.Options{}, auths)
+		if err != nil {
+			t.Fatalf("Pick() #%d error = %v", index, err)
+		}
+		if got == nil || got.ID != wantID {
+			t.Fatalf("Pick() #%d auth = %#v, want %s", index, got, wantID)
+		}
+	}
+}
+
+func TestQuotaAwareSelectorPick_SpreadBandResumesAfterCandidateLeaves(t *testing.T) {
+	t.Parallel()
+
+	selector := &QuotaAwareSelector{SpreadBandPercent: 10}
+	all := []*Auth{codexQuotaAuth("a", 100), codexQuotaAuth("b", 98), codexQuotaAuth("c", 97)}
+	withoutB := []*Auth{all[0], all[2]}
+
+	for index, step := range []struct {
+		auths []*Auth
+		want  string
+	}{
+		{all, "a"},
+		{withoutB, "c"},
+		{all, "a"},
+		{all, "b"},
+	} {
+		got, err := selector.Pick(context.Background(), "codex", "gpt-5.5", cliproxyexecutor.Options{}, step.auths)
+		if err != nil {
+			t.Fatalf("Pick() #%d error = %v", index, err)
+		}
+		if got == nil || got.ID != step.want {
+			t.Fatalf("Pick() #%d auth = %#v, want %s", index, got, step.want)
+		}
+	}
+}
+
+func TestQuotaAwareSelectorPick_ZeroSpreadBandAlwaysPicksHighest(t *testing.T) {
+	t.Parallel()
+
+	selector := &QuotaAwareSelector{WeeklyRemainingMinPercent: 20}
+	auths := []*Auth{codexQuotaAuth("a", 99), codexQuotaAuth("b", 100), codexQuotaAuth("c", 99)}
+
+	for index := 0; index < 3; index++ {
+		got, err := selector.Pick(context.Background(), "codex", "gpt-5.5", cliproxyexecutor.Options{}, auths)
+		if err != nil {
+			t.Fatalf("Pick() #%d error = %v", index, err)
+		}
+		if got == nil || got.ID != "b" {
+			t.Fatalf("Pick() #%d auth = %#v, want b", index, got)
+		}
+	}
+}
+
 func TestQuotaAwareSelectorPick_SkipsQuotaExceeded(t *testing.T) {
 	t.Parallel()
 
@@ -1299,6 +1365,115 @@ func TestSessionAffinitySelector_FailoverWhenAuthUnavailable(t *testing.T) {
 		if got.ID != second.ID {
 			t.Fatalf("Pick() #%d after failover inconsistent: got %q, want %q", i, got.ID, second.ID)
 		}
+	}
+}
+
+// Mirrors session codex:01a0f05a…: sticky account overloads, a previously successful
+// account for the same session is still available, and quota-aware would otherwise
+// prefer a cold high-remaining credential.
+func TestSessionAffinitySelector_FailoverPrefersWarmSessionAuth(t *testing.T) {
+	t.Parallel()
+
+	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback: &QuotaAwareSelector{WeeklyRemainingMinPercent: 20, SpreadBandPercent: 10},
+		TTL:      time.Minute,
+	})
+	defer selector.Stop()
+
+	sticky := codexQuotaAuth("sticky-overloaded", 95)
+	warm := codexQuotaAuth("warm-previous", 70)
+	cold := codexQuotaAuth("cold-high-remaining", 99)
+	opts := cliproxyexecutor.Options{OriginalRequest: []byte(`{"session_id":"01a0f05a-9a12-7fa1-b7c0-afb1b10577f7"}`)}
+	model := "gpt-5.6-sol"
+
+	// Seed a successful warm credential for this session (only warm is available).
+	first, err := selector.Pick(context.Background(), "mixed", model, opts, []*Auth{warm})
+	if err != nil || first == nil || first.ID != warm.ID {
+		t.Fatalf("initial warm pick = %#v, %v; want warm-previous", first, err)
+	}
+	selector.OnResult(Result{AuthID: warm.ID, Provider: "mixed", Model: model, Success: true, Options: opts})
+
+	// Later the session sticks to another account that then overloads.
+	primaryID, _ := extractExplicitSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
+	if primaryID == "" {
+		primaryID, _ = extractSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
+	}
+	primaryID = cliproxysession.BoundSessionIdentity(primaryID)
+	cacheKey := "mixed::" + primaryID + "::" + canonicalModelKey(model)
+	selector.cache.Set(cacheKey, sticky.ID)
+	selector.OnResult(Result{AuthID: sticky.ID, Provider: "mixed", Model: model, Success: true, Options: opts})
+	// Keep warm-previous in the MRU list ahead of sticky for the rebind path: the
+	// session previously succeeded on warm, then moved to sticky.
+	selector.cache.RecordWarm(cacheKey, warm.ID)
+
+	bound, err := selector.Pick(context.Background(), "mixed", model, opts, []*Auth{sticky, warm, cold})
+	if err != nil || bound == nil || bound.ID != sticky.ID {
+		t.Fatalf("sticky pick = %#v, %v; want sticky-overloaded", bound, err)
+	}
+	selector.OnResult(Result{
+		AuthID:   sticky.ID,
+		Provider: "mixed",
+		Model:    model,
+		Success:  false,
+		Error:    &Error{Code: "upstream_error", Message: "server_is_overloaded", HTTPStatus: http.StatusServiceUnavailable},
+		Options:  opts,
+	})
+
+	// Quota-aware alone would pick cold-high-remaining (99%). Warm preference must win.
+	// sticky is omitted the way the conductor excludes tried credentials.
+	rescued, err := selector.Pick(context.Background(), "mixed", model, opts, []*Auth{warm, cold})
+	if err != nil || rescued == nil || rescued.ID != warm.ID {
+		t.Fatalf("failover pick = %#v, %v; want warm-previous over cold-high-remaining", rescued, err)
+	}
+}
+
+func TestSessionAffinitySelector_OverloadKeepsStickyInWarmList(t *testing.T) {
+	t.Parallel()
+
+	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback: &QuotaAwareSelector{WeeklyRemainingMinPercent: 20, SpreadBandPercent: 10},
+		TTL:      time.Minute,
+	})
+	defer selector.Stop()
+
+	sticky := codexQuotaAuth("sticky-only", 60)
+	cold := codexQuotaAuth("cold-high-remaining", 99)
+	opts := cliproxyexecutor.Options{OriginalRequest: []byte(`{"session_id":"01a0f05a-single-account-session"}`)}
+	model := "gpt-5.6-sol"
+
+	bound, err := selector.Pick(context.Background(), "mixed", model, opts, []*Auth{sticky})
+	if err != nil || bound == nil || bound.ID != sticky.ID {
+		t.Fatalf("initial pick = %#v, %v; want sticky-only", bound, err)
+	}
+	selector.OnResult(Result{AuthID: sticky.ID, Provider: "mixed", Model: model, Success: true, Options: opts})
+	selector.OnResult(Result{
+		AuthID:   sticky.ID,
+		Provider: "mixed",
+		Model:    model,
+		Success:  false,
+		Error:    &Error{Code: "upstream_error", Message: "Selected model is at capacity. Please try a different model.", HTTPStatus: http.StatusTooManyRequests},
+		Options:  opts,
+	})
+
+	// After capacity shedding the sticky binding is gone, but the same account still
+	// holds the prompt cache. Prefer it over a cold high-remaining account.
+	rescued, err := selector.Pick(context.Background(), "mixed", model, opts, []*Auth{sticky, cold})
+	if err != nil || rescued == nil || rescued.ID != sticky.ID {
+		t.Fatalf("rebind after capacity = %#v, %v; want sticky-only retained in warm list", rescued, err)
+	}
+}
+
+func TestQuotaAwareSelector_RecentOverloadSoftDemotesAccount(t *testing.T) {
+	t.Parallel()
+
+	selector := &QuotaAwareSelector{WeeklyRemainingMinPercent: 20, SpreadBandPercent: 0}
+	healthy := codexQuotaAuth("healthy", 80)
+	shed := codexQuotaAuth("just-overloaded", 90)
+	shed.recordRecentOverload(time.Now())
+
+	picked, err := selector.Pick(context.Background(), "codex", "gpt-5.6-sol", cliproxyexecutor.Options{}, []*Auth{shed, healthy})
+	if err != nil || picked == nil || picked.ID != healthy.ID {
+		t.Fatalf("Pick() = %#v, %v; want healthy after soft demotion of just-overloaded", picked, err)
 	}
 }
 

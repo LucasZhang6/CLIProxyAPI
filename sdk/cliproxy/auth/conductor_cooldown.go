@@ -780,11 +780,9 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		if trackCooldownState {
 			cooldownRecordsBefore = m.cooldownStateRecordsForAuthLocked(auth, now)
 		}
-		auth.recordRecentRequest(now, result.Success)
-		if result.Success {
-			auth.Success++
-		} else {
-			auth.Failed++
+		applyRequestStatistic(ctx, auth, result, now)
+		if !result.Success && isCapacitySheddingResultError(result.Error) {
+			auth.recordRecentOverload(now)
 		}
 
 		if result.Success {
@@ -1058,12 +1056,7 @@ func (m *Manager) recordAvailabilityNeutralResult(ctx context.Context, result Re
 	m.mu.Lock()
 	if auth, ok := m.auths[result.AuthID]; ok && auth != nil {
 		now := time.Now()
-		auth.recordRecentRequest(now, result.Success)
-		if result.Success {
-			auth.Success++
-		} else {
-			auth.Failed++
-		}
+		applyRequestStatistic(ctx, auth, result, now)
 		auth.Generation++
 		auth.UpdatedAt = now
 		_ = m.persist(ctx, auth)
@@ -1499,6 +1492,23 @@ func shouldSkipCredentialCooldown(err *Error) bool {
 		return false
 	}
 	return isRequestScopedResultError(err) || isConnectionLifecycleResultError(err) || isTransientTransportResultError(err)
+}
+
+// isCapacitySheddingResultError reports upstream overload or model-at-capacity
+// rejections. These still cool the credential briefly, but they should not erase
+// session warm history and they soft-demote the account in quota-aware scoring.
+func isCapacitySheddingResultError(err *Error) bool {
+	if err == nil {
+		return false
+	}
+	status := statusCodeFromResult(err)
+	if status != http.StatusServiceUnavailable && status != http.StatusTooManyRequests && status != 0 {
+		return false
+	}
+	text := strings.ToLower(err.Message + "\n" + err.Code)
+	return strings.Contains(text, "overloaded") ||
+		strings.Contains(text, "server_is_overloaded") ||
+		strings.Contains(text, "at capacity")
 }
 
 // isConnectionLifecycleError reports transport/session lifecycle failures that must

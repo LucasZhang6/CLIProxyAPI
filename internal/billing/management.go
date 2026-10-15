@@ -2,7 +2,9 @@ package billing
 
 import (
 	"net/http"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 )
@@ -43,6 +45,24 @@ func (h *ManagementHandler) GetUsageByRequestID(c *gin.Context) {
 func (h *ManagementHandler) ExportUsage(c *gin.Context) {
 	if h == nil || h.service == nil {
 		c.JSON(http.StatusOK, []Event{})
+		return
+	}
+	limit := 0
+	if rawLimit := strings.TrimSpace(c.Query("limit")); rawLimit != "" {
+		if parsed, errParse := strconv.Atoi(rawLimit); errParse == nil && parsed > 0 {
+			limit = parsed
+		}
+	}
+	afterRaw := strings.TrimSpace(c.Query("after_completed_at"))
+	afterID := strings.TrimSpace(c.Query("after_event_id"))
+	if afterRaw != "" || afterID != "" || limit > 0 {
+		var after time.Time
+		if afterRaw != "" {
+			if parsed, errParse := time.Parse(time.RFC3339Nano, afterRaw); errParse == nil {
+				after = parsed
+			}
+		}
+		c.JSON(http.StatusOK, h.service.EventsAfter(after, afterID, limit))
 		return
 	}
 	c.JSON(http.StatusOK, h.service.Events())

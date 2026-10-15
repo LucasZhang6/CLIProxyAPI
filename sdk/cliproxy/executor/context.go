@@ -3,11 +3,13 @@ package executor
 import (
 	"context"
 	"sync/atomic"
+	"time"
 )
 
 type downstreamWebsocketContextKey struct{}
 type requireUpstreamWebsocketContextKey struct{}
 type upstreamAttemptTrackerContextKey struct{}
+type requestStartedAtContextKey struct{}
 
 type upstreamAttemptTracker struct {
 	attempted atomic.Bool
@@ -47,6 +49,27 @@ func RequiredUpstreamWebsocket(ctx context.Context) bool {
 	raw := ctx.Value(requireUpstreamWebsocketContextKey{})
 	enabled, ok := raw.(bool)
 	return ok && enabled
+}
+
+// WithRequestStartedAt records when the downstream request started executing.
+// An existing timestamp is kept so every credential attempt shares one clock.
+func WithRequestStartedAt(ctx context.Context, startedAt time.Time) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if _, ok := RequestStartedAt(ctx); ok {
+		return ctx
+	}
+	return context.WithValue(ctx, requestStartedAtContextKey{}, startedAt)
+}
+
+// RequestStartedAt returns the timestamp recorded by WithRequestStartedAt.
+func RequestStartedAt(ctx context.Context) (time.Time, bool) {
+	if ctx == nil {
+		return time.Time{}, false
+	}
+	startedAt, ok := ctx.Value(requestStartedAtContextKey{}).(time.Time)
+	return startedAt, ok && !startedAt.IsZero()
 }
 
 // WithUpstreamAttemptTracker installs a fresh tracker for one provider execution attempt.

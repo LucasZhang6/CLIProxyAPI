@@ -244,13 +244,21 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		return e.streamCodexDuplex(ctx, auth, req, opts, sess, conn, readCh, input, prepared, reporter, upstreamHeaders, unlockStreamSession), nil
 	}
 
-	buffering := e.cfg != nil && e.cfg.Codex.StreamBootstrapBuffering
+	// Do not hold translated Claude message_start events behind native Codex
+	// bootstrap probing. The /v1/messages handler provides its own SSE heartbeat.
+	buffering := shouldBufferCodexStreamBootstrap(e.cfg, from)
 	var bootstrapTimeout time.Duration
 	var bootstrapStart time.Time
 	var exhaustionLogged bool
+	bootstrapReadCtx := ctx
+	cancelBootstrapRead := func() {}
 	if buffering {
 		bootstrapTimeout = e.cfg.Codex.StreamBootstrapTimeoutDuration()
 		bootstrapStart = nowCodexBootstrap()
+		if bootstrapTimeout > 0 {
+			bootstrapReadCtx, cancelBootstrapRead = context.WithTimeout(ctx, bootstrapTimeout)
+			defer cancelBootstrapRead()
+		}
 	}
 
 	claudeInputTokens := helps.NewClaudeInputTokenState(from, to, responseFormat, originalPayload)
@@ -285,8 +293,13 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				}
 				return nil, ctx.Err()
 			}
-			msgType, payload, errRead := readCodexWebsocketMessage(ctx, sess, conn, readCh)
+			msgType, payload, errRead := readCodexWebsocketMessage(bootstrapReadCtx, sess, conn, readCh)
 			if errRead != nil {
+				if bootstrapTimeout > 0 && bootstrapReadCtx.Err() == context.DeadlineExceeded && ctx.Err() == nil {
+					timeSinceStart := nowCodexBootstrap().Sub(bootstrapStart)
+					helps.LogWithRequestID(ctx).Debugf("codex websockets executor: bootstrap wall-clock budget exhausted after %d messages / %d bytes / %v, actively releasing stream", bufferedFrames, bufferedBytes, timeSinceStart)
+					break
+				}
 				mappedErr := mapCodexWebsocketReadError(errRead)
 				if sess != nil {
 					e.invalidateUpstreamConn(sess, conn, "read_error", mappedErr)

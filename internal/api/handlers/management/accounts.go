@@ -48,7 +48,7 @@ func (h *Handler) AccountLogin(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request"})
 		return
 	}
-	token, expires, user, err := store.Login(req.Username, req.Password, accountPeerIP(c))
+	token, expires, user, err := store.Login(req.Username, req.Password, h.managementClientIP(c))
 	if err != nil {
 		if errors.Is(err, managementauth.ErrRateLimited) {
 			c.JSON(http.StatusTooManyRequests, gin.H{"error": "too many failed login attempts"})
@@ -215,7 +215,7 @@ func (h *Handler) managementAccountFromContext(c *gin.Context) (managementauth.U
 }
 
 func (h *Handler) managementAccountRemoteAllowed(c *gin.Context) bool {
-	clientIP := accountPeerIP(c)
+	clientIP := h.managementClientIP(c)
 	localClient := clientIP == "127.0.0.1" || clientIP == "::1"
 	if localClient {
 		return true
@@ -230,7 +230,7 @@ func (h *Handler) managementAccountRemoteAllowed(c *gin.Context) bool {
 	if h.allowRemoteOverride {
 		allowRemote = true
 	}
-	return allowRemote
+	return allowRemote || h.remoteManagementCIDRAllowed(clientIP)
 }
 
 func bearerToken(c *gin.Context) string {

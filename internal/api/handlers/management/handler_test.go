@@ -40,6 +40,25 @@ func TestAuthenticateManagementKey_LocalhostIPBan_BlocksCorrectKeyDuringBan(t *t
 	}
 }
 
+func TestAuthenticateManagementKeyAllowsConfiguredRemoteCIDR(t *testing.T) {
+	h := &Handler{
+		cfg: &config.Config{RemoteManagement: config.RemoteManagement{
+			AllowRemote:  false,
+			AllowedCIDRs: []string{"202.85.216.24/32"},
+		}},
+		failedAttempts: make(map[string]*attemptInfo),
+		envSecret:      "test-secret",
+	}
+	allowed, statusCode, errMsg := h.AuthenticateManagementKey("202.85.216.24", false, "test-secret")
+	if !allowed || statusCode != 0 || errMsg != "" {
+		t.Fatalf("allowed CIDR auth = allowed=%v status=%d msg=%q", allowed, statusCode, errMsg)
+	}
+	allowed, statusCode, errMsg = h.AuthenticateManagementKey("203.0.113.9", false, "test-secret")
+	if allowed || statusCode != http.StatusForbidden || errMsg != "remote management disabled" {
+		t.Fatalf("outside CIDR auth = allowed=%v status=%d msg=%q", allowed, statusCode, errMsg)
+	}
+}
+
 func TestMiddlewareSetsSupportPluginHeader(t *testing.T) {
 
 	h := &Handler{

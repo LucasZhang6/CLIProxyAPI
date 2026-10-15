@@ -7,6 +7,7 @@ import (
 	"crypto/subtle"
 	"fmt"
 	"net/http"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -302,7 +303,7 @@ func (h *Handler) Middleware() gin.HandlerFunc {
 		c.Header("X-CPA-BUILD-DATE", buildinfo.BuildDate)
 		c.Header("X-CPA-SUPPORT-PLUGIN", pluginhost.SupportPluginHeaderValue())
 
-		clientIP := c.ClientIP()
+		clientIP := h.managementClientIP(c)
 		localClient := clientIP == "127.0.0.1" || clientIP == "::1"
 
 		// Accept either Authorization: Bearer <key> or X-Management-Key
@@ -346,6 +347,78 @@ func (h *Handler) Middleware() gin.HandlerFunc {
 	}
 }
 
+// managementClientIP returns the address used for management authorization.
+// Direct clients are identified from the connected peer. When the peer is an
+// explicitly trusted reverse proxy, the last valid X-Forwarded-For address is
+// used because ALB appends the actual client address to that header. Forwarded
+// headers from untrusted peers are deliberately ignored.
+func (h *Handler) managementClientIP(c *gin.Context) string {
+	peerIP := accountPeerIP(c)
+	if peerIP == "127.0.0.1" || peerIP == "::1" {
+		return peerIP
+	}
+	if !h.managementTrustedProxyAllowed(peerIP) || c == nil {
+		return peerIP
+	}
+	if forwarded := strings.TrimSpace(c.GetHeader("X-Forwarded-For")); forwarded != "" {
+		parts := strings.Split(forwarded, ",")
+		for i := len(parts) - 1; i >= 0; i-- {
+			candidate := strings.TrimSpace(parts[i])
+			if addr, err := netip.ParseAddr(candidate); err == nil {
+				return addr.String()
+			}
+		}
+	}
+	if realIP := strings.TrimSpace(c.GetHeader("X-Real-IP")); realIP != "" {
+		if addr, err := netip.ParseAddr(realIP); err == nil {
+			return addr.String()
+		}
+	}
+	return peerIP
+}
+
+func (h *Handler) managementTrustedProxyAllowed(peerIP string) bool {
+	if h == nil || h.cfg == nil {
+		return false
+	}
+	return managementAddressAllowedByCIDRs(peerIP, h.cfg.RemoteManagement.TrustedProxyCIDRs)
+}
+
+func (h *Handler) remoteManagementCIDRAllowed(clientIP string) bool {
+	if h == nil || h.cfg == nil {
+		return false
+	}
+	return managementAddressAllowedByCIDRs(clientIP, h.cfg.RemoteManagement.AllowedCIDRs)
+}
+
+func managementAddressAllowedByCIDRs(clientIP string, cidrs []string) bool {
+	if strings.TrimSpace(clientIP) == "" || len(cidrs) == 0 {
+		return false
+	}
+	addr, err := netip.ParseAddr(strings.TrimSpace(clientIP))
+	if err != nil {
+		return false
+	}
+	for _, raw := range cidrs {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		if strings.Contains(raw, "/") {
+			prefix, errPrefix := netip.ParsePrefix(raw)
+			if errPrefix == nil && prefix.Contains(addr) {
+				return true
+			}
+			continue
+		}
+		allowedAddr, errAddr := netip.ParseAddr(raw)
+		if errAddr == nil && allowedAddr == addr {
+			return true
+		}
+	}
+	return false
+}
+
 // AuthenticateManagementKey verifies the provided management key for the given client.
 // It mirrors the behaviour of Middleware() so non-HTTP callers can reuse the same logic.
 func (h *Handler) AuthenticateManagementKey(clientIP string, localClient bool, provided string) (bool, int, string) {
@@ -366,6 +439,9 @@ func (h *Handler) AuthenticateManagementKey(clientIP string, localClient bool, p
 		secretHash = cfg.RemoteManagement.SecretKey
 	}
 	if h.allowRemoteOverride {
+		allowRemote = true
+	}
+	if !allowRemote && h.remoteManagementCIDRAllowed(clientIP) {
 		allowRemote = true
 	}
 	envSecret := h.envSecret

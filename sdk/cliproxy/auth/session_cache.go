@@ -10,6 +10,10 @@ import (
 const (
 	maxStableSessionAliases  = 64
 	defaultMaxSessionEntries = 65536
+	// maxSessionWarmAuths bounds how many recently successful credentials are
+	// remembered per session key for failover. Prompt caches are per-account, so
+	// preferring these on rebind keeps later turns warm after an overload.
+	maxSessionWarmAuths = 8
 )
 
 // sessionEntry stores an auth binding, its identifier aliases, and expiration.
@@ -19,11 +23,20 @@ type sessionEntry struct {
 	aliases   []string
 }
 
+// sessionWarmAuths is an MRU list of credentials that recently completed a
+// request for one session key. Failures do not clear it: a cooling account may
+// still hold the prompt cache for the next attempt on another credential.
+type sessionWarmAuths struct {
+	ids       []string
+	expiresAt time.Time
+}
+
 // SessionCache provides TTL-based session to auth mapping with automatic cleanup.
 type SessionCache struct {
 	mu               sync.RWMutex
 	entries          map[string]sessionEntry
 	groups           map[string]sessionEntry
+	warm             map[string]sessionWarmAuths
 	evictionOrder    *list.List
 	evictionElements map[string]*list.Element
 	maxEntries       int
@@ -49,6 +62,7 @@ func NewSessionCacheWithCapacity(ttl time.Duration, maxEntries int) *SessionCach
 	c := &SessionCache{
 		entries:          make(map[string]sessionEntry),
 		groups:           make(map[string]sessionEntry),
+		warm:             make(map[string]sessionWarmAuths),
 		evictionOrder:    list.New(),
 		evictionElements: make(map[string]*list.Element),
 		maxEntries:       maxEntries,
@@ -65,6 +79,9 @@ func (c *SessionCache) ensureInitializedLocked() {
 	}
 	if c.groups == nil {
 		c.groups = make(map[string]sessionEntry)
+	}
+	if c.warm == nil {
+		c.warm = make(map[string]sessionWarmAuths)
 	}
 	if c.evictionOrder == nil {
 		c.evictionOrder = list.New()
@@ -309,6 +326,76 @@ func mergeSessionAliases(existing []string, candidates ...string) []string {
 	return aliases
 }
 
+// RecordWarm remembers that authID successfully served sessionID. The list is
+// MRU-ordered and survives sticky unbind so failover can prefer a prompt-warm
+// credential over a cold high-remaining one.
+func (c *SessionCache) RecordWarm(sessionID, authID string) {
+	if c == nil || sessionID == "" || authID == "" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.ensureInitializedLocked()
+	now := time.Now()
+	entry := c.warm[sessionID]
+	ids := make([]string, 0, maxSessionWarmAuths)
+	ids = append(ids, authID)
+	for _, id := range entry.ids {
+		if id == authID {
+			continue
+		}
+		ids = append(ids, id)
+		if len(ids) >= maxSessionWarmAuths {
+			break
+		}
+	}
+	c.warm[sessionID] = sessionWarmAuths{ids: ids, expiresAt: now.Add(c.ttl)}
+}
+
+// WarmAuthIDs returns recently successful credentials for sessionID, most recent first.
+func (c *SessionCache) WarmAuthIDs(sessionID string) []string {
+	if c == nil || sessionID == "" {
+		return nil
+	}
+	c.mu.RLock()
+	entry, ok := c.warm[sessionID]
+	c.mu.RUnlock()
+	if !ok || !time.Now().Before(entry.expiresAt) || len(entry.ids) == 0 {
+		return nil
+	}
+	out := make([]string, len(entry.ids))
+	copy(out, entry.ids)
+	return out
+}
+
+// ForgetWarm drops authID from the session warm list so the next rebind does not
+// immediately retry a credential that just failed for this session.
+func (c *SessionCache) ForgetWarm(sessionID, authID string) {
+	if c == nil || sessionID == "" || authID == "" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.ensureInitializedLocked()
+	entry, ok := c.warm[sessionID]
+	if !ok || len(entry.ids) == 0 {
+		return
+	}
+	ids := make([]string, 0, len(entry.ids))
+	for _, id := range entry.ids {
+		if id == authID {
+			continue
+		}
+		ids = append(ids, id)
+	}
+	if len(ids) == 0 {
+		delete(c.warm, sessionID)
+		return
+	}
+	entry.ids = ids
+	c.warm[sessionID] = entry
+}
+
 // Touch refreshes the expiration for a session binding if it currently matches expectedAuthID.
 func (c *SessionCache) Touch(sessionID, expectedAuthID string) bool {
 	if c == nil || sessionID == "" || expectedAuthID == "" {
@@ -442,6 +529,11 @@ func (c *SessionCache) cleanup() {
 	for _, group := range c.groups {
 		if !now.Before(group.expiresAt) {
 			c.removeAliasGroupLocked(group)
+		}
+	}
+	for key, entry := range c.warm {
+		if !now.Before(entry.expiresAt) {
+			delete(c.warm, key)
 		}
 	}
 }

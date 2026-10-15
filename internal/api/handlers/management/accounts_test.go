@@ -224,6 +224,60 @@ func attachManagementAccountStoreForTest(h *Handler, s *managementauth.Store) {
 	}
 }
 
+func TestAccountLoginAllowsConfiguredRemoteCIDR(t *testing.T) {
+	h, store, password := newAccountHandlerTest(t)
+	h.allowRemoteOverride = false
+	h.cfg.RemoteManagement.AllowRemote = false
+	h.cfg.RemoteManagement.AllowedCIDRs = []string{"202.85.216.24/32"}
+	router := accountRouter(h, store)
+	req := httptest.NewRequest(http.MethodPost, "/accounts/login", strings.NewReader(`{"username":"admin","password":`+quoteJSON(password)+`}`))
+	req.RemoteAddr = "202.85.216.24:23456"
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("allowed CIDR login status=%d body=%s", w.Code, w.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/accounts/login", strings.NewReader(`{"username":"admin","password":`+quoteJSON(password)+`}`))
+	req.RemoteAddr = "203.0.113.9:23456"
+	req.Header.Set("Content-Type", "application/json")
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("outside CIDR login status=%d, want forbidden; body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestAccountLoginUsesForwardedClientIPOnlyFromTrustedProxy(t *testing.T) {
+	h, store, password := newAccountHandlerTest(t)
+	h.allowRemoteOverride = false
+	h.cfg.RemoteManagement.AllowRemote = false
+	h.cfg.RemoteManagement.AllowedCIDRs = []string{"18.191.153.54/32"}
+	h.cfg.RemoteManagement.TrustedProxyCIDRs = []string{"172.31.0.0/16"}
+	router := accountRouter(h, store)
+
+	req := httptest.NewRequest(http.MethodPost, "/accounts/login", strings.NewReader(`{"username":"admin","password":`+quoteJSON(password)+`}`))
+	req.RemoteAddr = "172.31.13.20:23456"
+	req.Header.Set("X-Forwarded-For", "18.191.153.54")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("trusted proxy login status=%d body=%s", w.Code, w.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/accounts/login", strings.NewReader(`{"username":"admin","password":`+quoteJSON(password)+`}`))
+	req.RemoteAddr = "203.0.113.9:23456"
+	req.Header.Set("X-Forwarded-For", "18.191.153.54")
+	req.Header.Set("Content-Type", "application/json")
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("untrusted proxy spoof status=%d, want forbidden; body=%s", w.Code, w.Body.String())
+	}
+}
+
 func TestAccountLoginRejectsSpoofedForwardingHeaders(t *testing.T) {
 	h, store, password := newAccountHandlerTest(t)
 	h.allowRemoteOverride = false

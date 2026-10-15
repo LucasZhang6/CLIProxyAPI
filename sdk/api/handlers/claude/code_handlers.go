@@ -9,7 +9,6 @@ package claude
 import (
 	"bytes"
 	"compress/gzip"
-	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -34,6 +33,8 @@ import (
 type ClaudeCodeAPIHandler struct {
 	*handlers.BaseAPIHandler
 }
+
+const defaultClaudeStreamKeepAliveInterval = 15 * time.Second
 
 // NewClaudeCodeAPIHandler creates a new Claude API handlers instance.
 // It takes an BaseAPIHandler instance as input and returns a ClaudeCodeAPIHandler.
@@ -119,7 +120,7 @@ func (h *ClaudeCodeAPIHandler) ClaudeCountTokens(c *gin.Context) {
 	c.Header("Content-Type", "application/json")
 
 	alt := h.GetAlt(c)
-	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
+	cliCtx, cliCancel := h.GetContextWithCancel(h, c, c.Request.Context())
 
 	modelName := gjson.GetBytes(rawJSON, "model").String()
 
@@ -171,7 +172,7 @@ func (h *ClaudeCodeAPIHandler) ClaudeModels(c *gin.Context) {
 func (h *ClaudeCodeAPIHandler) handleNonStreamingResponse(c *gin.Context, rawJSON []byte) {
 	c.Header("Content-Type", "application/json")
 	alt := h.GetAlt(c)
-	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
+	cliCtx, cliCancel := h.GetContextWithCancel(h, c, c.Request.Context())
 	stopKeepAlive := h.StartNonStreamingKeepAlive(c, cliCtx)
 
 	modelName := gjson.GetBytes(rawJSON, "model").String()
@@ -235,15 +236,52 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 
 	// Create a cancellable context for the backend client request
 	// This allows proper cleanup and cancellation of ongoing requests
-	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
+	cliCtx, cliCancel := h.GetContextWithCancel(h, c, c.Request.Context())
 
-	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "")
+	type streamStart struct {
+		data    <-chan []byte
+		headers http.Header
+		errs    <-chan *interfaces.ErrorMessage
+	}
+	startChan := make(chan streamStart, 1)
+	go func() {
+		data, headers, errs := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "")
+		select {
+		case startChan <- streamStart{data: data, headers: headers, errs: errs}:
+		case <-cliCtx.Done():
+		}
+	}()
+	var dataChan <-chan []byte
+	var upstreamHeaders http.Header
+	var errChan <-chan *interfaces.ErrorMessage
 	setSSEHeaders := func() {
 		c.Header("Content-Type", "text/event-stream")
 		c.Header("Cache-Control", "no-cache")
 		c.Header("Connection", "keep-alive")
 		c.Header("Access-Control-Allow-Origin", "*")
 	}
+	streamCommitted := false
+	commitStream := func() {
+		if streamCommitted {
+			return
+		}
+		setSSEHeaders()
+		handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+		streamCommitted = true
+	}
+	writeStreamError := func(errMsg *interfaces.ErrorMessage) {
+		if errMsg == nil {
+			return
+		}
+		errorBytes, _ := json.Marshal(h.toClaudeError(errMsg))
+		_, _ = fmt.Fprintf(c.Writer, "event: error\ndata: %s\n\n", errorBytes)
+	}
+	keepAliveInterval := handlers.StreamingKeepAliveInterval(h.Cfg)
+	if keepAliveInterval <= 0 {
+		keepAliveInterval = defaultClaudeStreamKeepAliveInterval
+	}
+	keepAlive := time.NewTicker(keepAliveInterval)
+	defer keepAlive.Stop()
 
 	// Peek at the first chunk to determine success or failure before setting headers
 	for {
@@ -251,14 +289,25 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 		case <-c.Request.Context().Done():
 			cliCancel(c.Request.Context().Err())
 			return
+		case started := <-startChan:
+			dataChan = started.data
+			upstreamHeaders = started.headers
+			errChan = started.errs
+			startChan = nil
 		case errMsg, ok := <-errChan:
 			if !ok {
 				// Err channel closed cleanly; wait for data channel.
 				errChan = nil
 				continue
 			}
-			// Upstream failed immediately. Return proper error status and JSON.
-			h.WriteErrorResponse(c, errMsg)
+			if streamCommitted {
+				writeStreamError(errMsg)
+				flusher.Flush()
+			} else {
+				// Preserve the upstream HTTP status until the first heartbeat or
+				// payload commits the SSE response.
+				h.WriteErrorResponse(c, errMsg)
+			}
 			if errMsg != nil {
 				cliCancel(errMsg.Error)
 			} else {
@@ -268,7 +317,12 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 		case chunk, ok := <-dataChan:
 			if !ok {
 				if errMsg, hasPendingError := handlers.PendingStreamError(errChan); hasPendingError {
-					h.WriteErrorResponse(c, errMsg)
+					if streamCommitted {
+						writeStreamError(errMsg)
+						flusher.Flush()
+					} else {
+						h.WriteErrorResponse(c, errMsg)
+					}
 					if errMsg != nil {
 						cliCancel(errMsg.Error)
 					} else {
@@ -277,16 +331,14 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 					return
 				}
 				// Stream closed without data? Send DONE or just headers.
-				setSSEHeaders()
-				handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+				commitStream()
 				flusher.Flush()
 				cliCancel(nil)
 				return
 			}
 
 			// Success! Set headers now.
-			setSSEHeaders()
-			handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+			commitStream()
 
 			// Write the first chunk
 			if len(chunk) > 0 {
@@ -295,14 +347,20 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 			}
 
 			// Continue streaming the rest
-			h.forwardClaudeStream(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan)
+			keepAlive.Stop()
+			h.forwardClaudeStream(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan, keepAliveInterval)
 			return
+		case <-keepAlive.C:
+			commitStream()
+			_, _ = c.Writer.Write([]byte(": keep-alive\n\n"))
+			flusher.Flush()
 		}
 	}
 }
 
-func (h *ClaudeCodeAPIHandler) forwardClaudeStream(c *gin.Context, flusher http.Flusher, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage) {
+func (h *ClaudeCodeAPIHandler) forwardClaudeStream(c *gin.Context, flusher http.Flusher, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage, keepAliveInterval time.Duration) {
 	h.ForwardStream(c, flusher, cancel, data, errs, handlers.StreamForwardOptions{
+		KeepAliveInterval: &keepAliveInterval,
 		WriteChunk: func(chunk []byte) {
 			if len(chunk) == 0 {
 				return
@@ -313,12 +371,6 @@ func (h *ClaudeCodeAPIHandler) forwardClaudeStream(c *gin.Context, flusher http.
 			if errMsg == nil {
 				return
 			}
-			status := http.StatusInternalServerError
-			if errMsg.StatusCode > 0 {
-				status = errMsg.StatusCode
-			}
-			c.Status(status)
-
 			errorBytes, _ := json.Marshal(h.toClaudeError(errMsg))
 			_, _ = fmt.Fprintf(c.Writer, "event: error\ndata: %s\n\n", errorBytes)
 		},

@@ -68,56 +68,10 @@ func ExtractSessionInfo(headers http.Header, payload []byte, metadata map[string
 		if hasNestedReq {
 			reqRoot = req
 		}
-		for _, p := range []string{
-			// Standard session / thread parent keys
-			"parent_session_id", "parentSessionId", "parentSessionID",
-			"parent_thread_id", "parentThreadId", "parentThreadID",
-			"forked_from_thread_id", "forked_from_id",
-			"parent_conversation_id", "parentConversationId", "parentConversationID",
-			// OpenCode / generic parent ID keys
-			"parent_id", "parentId", "parentID",
-			// Roo Code / Cline task delegation keys
-			"parent_task_id", "parentTaskId", "parentTaskID",
-			// OpenHands action tree keys
-			"parent_action_id", "parentActionId", "parentActionID",
-			// Pi session keys
-			"parent_session", "parentSession",
-			// Hermes subagent keys
-			"parent_subagent_id", "parentSubagentId",
-			// OpenClaw fork sources
-			"forkSource.sessionId", "fork_source.session_id",
-			"previousSessionId", "previous_session_id",
-			// Metadata nested keys
-			"metadata.parent_session_id", "metadata.parentSessionId", "metadata.parentSessionID",
-			"metadata.parent_thread_id", "metadata.parentThreadId",
-			"metadata.forked_from_thread_id", "metadata.forked_from_id",
-			"metadata.parent_id", "metadata.parentId", "metadata.parentID",
-			"metadata.parent_task_id", "metadata.parentTaskId", "metadata.parentTaskID",
-			"metadata.parent_action_id", "metadata.parentActionId",
-			"metadata.parent_subagent_id", "metadata.parentSubagentId",
-			"metadata.parent_session", "metadata.parentSession",
-			"metadata.parent_agent_id", "metadata.parentAgentId",
-			"metadata.forkSource.sessionId", "metadata.previousSessionId",
-			// Extra body nested keys
-			"extra_body.parent_session_id", "extra_body.parentSessionId", "extra_body.parentSessionID",
-			"extra_body.parent_thread_id", "extra_body.parentThreadId",
-			"extra_body.forked_from_thread_id", "extra_body.forked_from_id",
-			"extra_body.parent_id", "extra_body.parentId", "extra_body.parentID",
-			"extra_body.parent_task_id", "extra_body.parentTaskId",
-			"extra_body.parent_action_id", "extra_body.parentActionId",
-			"extra_body.parent_subagent_id", "extra_body.parentSubagentId",
-			"extra_body.parent_session", "extra_body.parentSession",
-		} {
-			if val := normalizedSessionCandidate(root.Get(p).String()); val != "" {
-				parentCandidate = val
-				break
-			}
-			if hasNestedReq {
-				if val := normalizedSessionCandidate(reqRoot.Get(p).String()); val != "" {
-					parentCandidate = val
-					break
-				}
-			}
+		if hasNestedReq {
+			parentCandidate = firstNormalizedPathValue(root, reqRoot)
+		} else {
+			parentCandidate = firstNormalizedPathValue(root)
 		}
 		if parentCandidate == "" {
 			parentCandidate = ClaudeMetadataParentSessionID(payload)
@@ -264,15 +218,10 @@ func ExtractSessionInfo(headers http.Header, payload []byte, metadata map[string
 		tid = normalizedSessionCandidate(codexTurnMetaJSON.Get("thread_id").String())
 	}
 	if tid == "" && sid != "" && root.Exists() {
-		for _, path := range []string{"thread_id", "threadId", "metadata.thread_id"} {
-			if tid = normalizedSessionCandidate(root.Get(path).String()); tid != "" {
-				break
-			}
-			if hasNestedReq {
-				if tid = normalizedSessionCandidate(reqRoot.Get(path).String()); tid != "" {
-					break
-				}
-			}
+		if hasNestedReq {
+			tid = firstNormalizedPathValueAmong(sessionThreadCandidatePaths, root, reqRoot)
+		} else {
+			tid = firstNormalizedPathValueAmong(sessionThreadCandidatePaths, root)
 		}
 	}
 
@@ -294,19 +243,10 @@ func ExtractSessionInfo(headers http.Header, payload []byte, metadata map[string
 			}
 		}
 		if forkedFrom == "" && root.Exists() {
-			for _, forkPath := range []string{
-				"forked_from_thread_id", "forked_from_id",
-				"metadata.forked_from_thread_id", "metadata.forked_from_id",
-				"extra_body.forked_from_thread_id", "extra_body.forked_from_id",
-			} {
-				if forkedFrom = normalizedSessionCandidate(root.Get(forkPath).String()); forkedFrom != "" {
-					break
-				}
-				if hasNestedReq {
-					if forkedFrom = normalizedSessionCandidate(reqRoot.Get(forkPath).String()); forkedFrom != "" {
-						break
-					}
-				}
+			if hasNestedReq {
+				forkedFrom = firstNormalizedPathValueAmong(sessionForkCandidatePaths, root, reqRoot)
+			} else {
+				forkedFrom = firstNormalizedPathValueAmong(sessionForkCandidatePaths, root)
 			}
 		}
 

@@ -21,6 +21,80 @@ import (
 	"github.com/tidwall/sjson"
 )
 
+type codexScannedLine struct {
+	line []byte
+	err  error
+	done bool
+}
+
+// codexLineScanner keeps the body read in one goroutine so bootstrap release
+// can be driven by a wall-clock timer even while the upstream is byte-silent.
+// The unbuffered result channel keeps read-ahead bounded to one SSE line.
+type codexLineScanner struct {
+	ctx      context.Context
+	results  <-chan codexScannedLine
+	line     []byte
+	err      error
+	timedOut bool
+}
+
+func newCodexLineScanner(ctx context.Context, body io.Reader) *codexLineScanner {
+	scanner := bufio.NewScanner(body)
+	scanner.Buffer(nil, 52_428_800) // 50MB
+	results := make(chan codexScannedLine)
+	go func() {
+		defer close(results)
+		for scanner.Scan() {
+			result := codexScannedLine{line: bytes.Clone(scanner.Bytes())}
+			select {
+			case results <- result:
+			case <-ctx.Done():
+				return
+			}
+		}
+		result := codexScannedLine{err: scanner.Err(), done: true}
+		select {
+		case results <- result:
+		case <-ctx.Done():
+		}
+	}()
+	return &codexLineScanner{ctx: ctx, results: results}
+}
+
+func (s *codexLineScanner) Scan() bool {
+	return s.scanUntil(nil)
+}
+
+func (s *codexLineScanner) ScanUntil(timeout <-chan time.Time) bool {
+	return s.scanUntil(timeout)
+}
+
+func (s *codexLineScanner) scanUntil(timeout <-chan time.Time) bool {
+	s.timedOut = false
+	select {
+	case <-s.ctx.Done():
+		s.err = s.ctx.Err()
+		return false
+	case <-timeout:
+		s.timedOut = true
+		return false
+	case result, ok := <-s.results:
+		if !ok {
+			return false
+		}
+		if result.done {
+			s.err = result.err
+			return false
+		}
+		s.line = result.line
+		return true
+	}
+}
+
+func (s *codexLineScanner) Bytes() []byte  { return s.line }
+func (s *codexLineScanner) Err() error     { return s.err }
+func (s *codexLineScanner) TimedOut() bool { return s.timedOut }
+
 func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
 	ctx = helps.EnsureSessionContext(ctx, opts, req.Payload)
 	if opts.Alt == "responses/compact" {
@@ -60,6 +134,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
 	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
+	body = normalizeCodexReasoningEffortForModel(body, req, baseModel)
 	body, _ = sjson.DeleteBytes(body, "previous_response_id")
 	body, _ = sjson.DeleteBytes(body, "generate")
 	body, _ = sjson.DeleteBytes(body, "prompt_cache_retention")
@@ -138,16 +213,19 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		return nil, err
 	}
 
-	buffering := e.cfg != nil && e.cfg.Codex.StreamBootstrapBuffering
+	// Claude /v1/messages clients need the translated message_start promptly so
+	// they can keep their own SSE watchdog alive. Bootstrap probing remains
+	// enabled for native Responses clients, where withholding headers permits
+	// transparent credential failover.
+	buffering := shouldBufferCodexStreamBootstrap(e.cfg, from)
 	var bootstrapTimeout time.Duration
 	var bootstrapStart time.Time
 	if buffering {
-		bootstrapTimeout = e.cfg.Codex.StreamBootstrapTimeoutDuration()
 		bootstrapStart = nowCodexBootstrap()
+		bootstrapTimeout = codexStreamBootstrapTimeout(ctx, e.cfg, body, bootstrapStart)
 	}
 
-	scanner := bufio.NewScanner(httpResp.Body)
-	scanner.Buffer(nil, 52_428_800) // 50MB
+	scanner := newCodexLineScanner(ctx, httpResp.Body)
 	claudeInputTokens := helps.NewClaudeInputTokenState(from, to, responseFormat, originalPayload)
 	var param any
 	outputItemsByIndex := make(map[int64][]byte)
@@ -183,7 +261,14 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 
 	sawOutputDelta := false
 	if buffering {
-		for scanner.Scan() {
+		var bootstrapTimer *time.Timer
+		var bootstrapTimerC <-chan time.Time
+		if bootstrapTimeout > 0 {
+			bootstrapTimer = time.NewTimer(bootstrapTimeout)
+			bootstrapTimerC = bootstrapTimer.C
+			defer bootstrapTimer.Stop()
+		}
+		for scanner.ScanUntil(bootstrapTimerC) {
 			line := applyCodexIdentityConfuseResponsePayload(scanner.Bytes(), identityState)
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 			var translatedLine []byte
@@ -302,6 +387,11 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 				immediateTerminal = true
 			}
 			break
+		}
+		if scanner.TimedOut() {
+			timeSinceStart := nowCodexBootstrap().Sub(bootstrapStart)
+			helps.LogWithRequestID(ctx).Debugf("codex executor: bootstrap wall-clock budget exhausted after %d lines / %d bytes / %v, actively releasing stream", bufferedFrames, bufferedBytes, timeSinceStart)
+			streamStarted = true
 		}
 
 		if !streamStarted && bootstrapTerminalErr == nil {

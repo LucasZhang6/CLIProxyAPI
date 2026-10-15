@@ -208,6 +208,14 @@ type CodexConfig struct {
 	// When set (e.g. "20s"), the stream is released once the time ceiling is reached, avoiding
 	// reverse-proxy timeouts (e.g. Nginx 60s proxy_read_timeout).
 	StreamBootstrapTimeout string `yaml:"stream-bootstrap-timeout,omitempty" json:"stream-bootstrap-timeout,omitempty"`
+	// StreamBootstrapFirstTurnTimeout optionally holds headers longer for requests that open a
+	// conversation, so a capacity rejection the upstream sends after stream-bootstrap-timeout can
+	// still fail over to another credential. It only applies when longer than
+	// stream-bootstrap-timeout and when stream-bootstrap-timeout is positive.
+	StreamBootstrapFirstTurnTimeout string `yaml:"stream-bootstrap-first-turn-timeout,omitempty" json:"stream-bootstrap-first-turn-timeout,omitempty"`
+	// StreamBootstrapFirstTurnWindow bounds the first-turn extension: a hold beyond
+	// stream-bootstrap-timeout must end within this duration of the request start.
+	StreamBootstrapFirstTurnWindow string `yaml:"stream-bootstrap-first-turn-window,omitempty" json:"stream-bootstrap-first-turn-window,omitempty"`
 	// OptimizeMultiAgentV2 optimizes official Codex multi-agent requests.
 	OptimizeMultiAgentV2 bool `yaml:"optimize-multi-agent-v2" json:"optimize-multi-agent-v2"`
 	// OrphanDelegationCompatibility enables opt-in compatibility for orphan Codex delegation outputs.
@@ -236,7 +244,30 @@ func (c *CodexConfig) StreamBootstrapTimeoutDuration() time.Duration {
 	if c == nil {
 		return DefaultCodexStreamBootstrapTimeout
 	}
-	raw := strings.TrimSpace(c.StreamBootstrapTimeout)
+	return parseBootstrapDuration(c.StreamBootstrapTimeout)
+}
+
+// StreamBootstrapFirstTurnTimeoutDuration returns the per-attempt bootstrap hold for
+// conversation-opening requests, or 0 when unset. Values use the same syntax as
+// StreamBootstrapTimeout.
+func (c *CodexConfig) StreamBootstrapFirstTurnTimeoutDuration() time.Duration {
+	if c == nil {
+		return 0
+	}
+	return parseBootstrapDuration(c.StreamBootstrapFirstTurnTimeout)
+}
+
+// StreamBootstrapFirstTurnWindowDuration returns the request-level bound for the
+// first-turn extension, or 0 when unset.
+func (c *CodexConfig) StreamBootstrapFirstTurnWindowDuration() time.Duration {
+	if c == nil {
+		return 0
+	}
+	return parseBootstrapDuration(c.StreamBootstrapFirstTurnWindow)
+}
+
+func parseBootstrapDuration(raw string) time.Duration {
+	raw = strings.TrimSpace(raw)
 	if raw == "" || raw == "0" || strings.EqualFold(raw, "none") || strings.EqualFold(raw, "unlimited") || strings.EqualFold(raw, "disabled") || strings.EqualFold(raw, "off") || strings.EqualFold(raw, "never") {
 		return 0
 	}
@@ -320,8 +351,14 @@ type DiscoveryConfig struct {
 
 // RemoteManagement holds management API configuration under 'remote-management'.
 type RemoteManagement struct {
-	// AllowRemote toggles remote (non-localhost) access to management API.
+	// AllowRemote toggles unrestricted remote (non-localhost) access to management API.
 	AllowRemote bool `yaml:"allow-remote"`
+	// AllowedCIDRs restricts remote management to specific client IP CIDRs when AllowRemote is false.
+	AllowedCIDRs []string `yaml:"allowed-cidrs"`
+	// TrustedProxyCIDRs identifies reverse-proxy peers allowed to provide the
+	// client address through X-Forwarded-For for management access decisions.
+	// Forwarded headers from untrusted peers are ignored.
+	TrustedProxyCIDRs []string `yaml:"trusted-proxy-cidrs"`
 	// SecretKey is the management key (plaintext or bcrypt hashed). YAML key intentionally 'secret-key'.
 	SecretKey string `yaml:"secret-key"`
 	// DisableControlPanel skips serving and syncing the bundled management UI when true.
@@ -356,6 +393,11 @@ type QuotaAwareRoutingConfig struct {
 	// at least one candidate with known quota remains above the threshold.
 	// Default: 20. Set to 0 to only sort by highest remaining quota.
 	WeeklyRemainingMinPercent *int `yaml:"weekly-remaining-min-percent,omitempty" json:"weekly-remaining-min-percent,omitempty"`
+
+	// SpreadBandPercent rotates new sessions across every candidate whose weekly remaining
+	// quota is within this many percentage points of the highest one, instead of always
+	// picking the single highest. Default: 0 (always pick the highest).
+	SpreadBandPercent *int `yaml:"spread-band-percent,omitempty" json:"spread-band-percent,omitempty"`
 }
 
 // RoutingConfig configures how credentials are selected for requests.

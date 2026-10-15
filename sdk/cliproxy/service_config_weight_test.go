@@ -23,11 +23,13 @@ func TestWeightedRoundRobinRoutingSelector(t *testing.T) {
 
 func TestQuotaAwareRoutingSelector(t *testing.T) {
 	threshold := 35
+	band := 10
 	state := normalizedRoutingRuntimeState(&internalconfig.Config{
 		Routing: internalconfig.RoutingConfig{
 			Strategy: "quota-aware",
 			QuotaAware: internalconfig.QuotaAwareRoutingConfig{
 				WeeklyRemainingMinPercent: &threshold,
+				SpreadBandPercent:         &band,
 			},
 		},
 	})
@@ -40,6 +42,23 @@ func TestQuotaAwareRoutingSelector(t *testing.T) {
 	}
 	if selector.WeeklyRemainingMinPercent != threshold {
 		t.Fatalf("weekly threshold = %d, want %d", selector.WeeklyRemainingMinPercent, threshold)
+	}
+	if selector.SpreadBandPercent != band {
+		t.Fatalf("spread band = %d, want %d", selector.SpreadBandPercent, band)
+	}
+
+	changedBand := 5
+	changed := normalizedRoutingRuntimeState(&internalconfig.Config{
+		Routing: internalconfig.RoutingConfig{
+			Strategy: "quota-aware",
+			QuotaAware: internalconfig.QuotaAwareRoutingConfig{
+				WeeklyRemainingMinPercent: &threshold,
+				SpreadBandPercent:         &changedBand,
+			},
+		},
+	})
+	if changed == state {
+		t.Fatal("spread band change must rebuild the routing selector")
 	}
 }
 

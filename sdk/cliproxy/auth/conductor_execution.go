@@ -28,6 +28,118 @@ func newUpstreamAttemptContext(ctx context.Context) context.Context {
 	return cliproxyexecutor.WithUpstreamAttemptTracker(ctx)
 }
 
+// requestOutcomeStats collects upstream failures that may still be failed over.
+// The dashboard counters record one failure only when the client request ends
+// in error, instead of counting every rejected credential along the way.
+type requestOutcomeStats struct {
+	mu      sync.Mutex
+	pending Result
+	has     bool
+}
+
+type requestOutcomeStatsKey struct{}
+
+func withRequestOutcomeStats(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if requestOutcomeStatsFrom(ctx) != nil {
+		return ctx
+	}
+	return context.WithValue(ctx, requestOutcomeStatsKey{}, &requestOutcomeStats{})
+}
+
+func requestOutcomeStatsFrom(ctx context.Context) *requestOutcomeStats {
+	if ctx == nil {
+		return nil
+	}
+	stats, _ := ctx.Value(requestOutcomeStatsKey{}).(*requestOutcomeStats)
+	return stats
+}
+
+func shouldDeferRequestStatistic(ctx context.Context, result Result) bool {
+	return !result.Success && !result.RecordRequestStatistics && requestOutcomeStatsFrom(ctx) != nil
+}
+
+func noteSuppressedRequestFailure(ctx context.Context, result Result) {
+	stats := requestOutcomeStatsFrom(ctx)
+	if stats == nil || result.AuthID == "" {
+		return
+	}
+	stats.mu.Lock()
+	stats.pending = Result{
+		AuthID:     result.AuthID,
+		Provider:   result.Provider,
+		Model:      result.Model,
+		RouteModel: result.RouteModel,
+	}
+	stats.has = true
+	stats.mu.Unlock()
+}
+
+func discardSuppressedRequestFailure(ctx context.Context) {
+	stats := requestOutcomeStatsFrom(ctx)
+	if stats == nil {
+		return
+	}
+	stats.mu.Lock()
+	stats.pending = Result{}
+	stats.has = false
+	stats.mu.Unlock()
+}
+
+func takeSuppressedRequestFailure(ctx context.Context) (Result, bool) {
+	stats := requestOutcomeStatsFrom(ctx)
+	if stats == nil {
+		return Result{}, false
+	}
+	stats.mu.Lock()
+	defer stats.mu.Unlock()
+	if !stats.has {
+		return Result{}, false
+	}
+	result := stats.pending
+	stats.pending = Result{}
+	stats.has = false
+	return result, true
+}
+
+func (m *Manager) flushSuppressedRequestFailure(ctx context.Context) {
+	if m == nil {
+		return
+	}
+	result, ok := takeSuppressedRequestFailure(ctx)
+	if !ok || result.AuthID == "" {
+		return
+	}
+	now := time.Now()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	auth := m.auths[result.AuthID]
+	if auth == nil {
+		return
+	}
+	auth.recordRecentRequest(now, false)
+	auth.Failed++
+}
+
+func applyRequestStatistic(ctx context.Context, auth *Auth, result Result, now time.Time) {
+	if auth == nil {
+		return
+	}
+	if shouldDeferRequestStatistic(ctx, result) {
+		noteSuppressedRequestFailure(ctx, result)
+		return
+	}
+	discardSuppressedRequestFailure(ctx)
+	auth.recordRecentRequest(now, result.Success)
+	if result.Success {
+		auth.Success++
+		return
+	}
+	auth.Failed++
+}
+
 func claudeOAuthRequestCancellation(ctx context.Context, auth *Auth, err error) error {
 	if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), "claude") || !strings.EqualFold(strings.TrimSpace(auth.Attributes["auth_kind"]), "oauth") {
 		return nil
@@ -118,7 +230,13 @@ func preferredExecutionAttemptError(fallback, upstream error) error {
 
 // Execute performs a non-streaming execution using the configured selector and executor.
 // It supports multiple providers for the same model and round-robins the starting provider per model.
-func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
+	ctx = withRequestOutcomeStats(ctx)
+	defer func() {
+		if err != nil {
+			m.flushSuppressedRequestFailure(ctx)
+		}
+	}()
 	ctx = cliproxyexecutor.WithRequestProxyURL(ctx, opts.ProxyURL)
 	req, opts = cliproxysession.Enrich(req, opts)
 	normalized := m.normalizeProviders(providers)
@@ -178,7 +296,13 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 }
 
 // It supports multiple providers for the same model and round-robins the starting provider per model.
-func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
+	ctx = withRequestOutcomeStats(ctx)
+	defer func() {
+		if err != nil {
+			m.flushSuppressedRequestFailure(ctx)
+		}
+	}()
 	ctx = cliproxyexecutor.WithRequestProxyURL(ctx, opts.ProxyURL)
 	req, opts = cliproxysession.Enrich(req, opts)
 	normalized := m.normalizeProviders(providers)
@@ -231,8 +355,15 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 
 // ExecuteStream performs a streaming execution using the configured selector and executor.
 // It supports multiple providers for the same model and round-robins the starting provider per model.
-func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (streamResult *cliproxyexecutor.StreamResult, err error) {
+	ctx = withRequestOutcomeStats(ctx)
+	defer func() {
+		if err != nil {
+			m.flushSuppressedRequestFailure(ctx)
+		}
+	}()
 	ctx = cliproxyexecutor.WithRequestProxyURL(ctx, opts.ProxyURL)
+	ctx = cliproxyexecutor.WithRequestStartedAt(ctx, time.Now())
 	req, opts = cliproxysession.Enrich(req, opts)
 	if m.HomeEnabled() {
 		if unlockSession := m.lockHomeWebsocketSession(ctx, opts); unlockSession != nil {
@@ -311,6 +442,7 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 		}
 		var bootstrapErr *streamBootstrapError
 		if errors.As(lastErr, &bootstrapErr) && bootstrapErr != nil {
+			m.flushSuppressedRequestFailure(ctx)
 			return streamErrorResult(bootstrapErr.Headers(), lastErr), nil
 		}
 		return nil, lastErr

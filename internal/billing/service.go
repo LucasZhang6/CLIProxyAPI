@@ -2,6 +2,7 @@ package billing
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -9,6 +10,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -18,6 +20,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 )
@@ -28,6 +31,10 @@ const (
 	modeEnforceSoft           = "enforce-soft"
 	modeEnforceHard           = "enforce-hard"
 	policySuccessFinalAttempt = "success_final_attempt_v1"
+
+	unknownPricePolicyRecordUnpriced       = "record-unpriced"
+	unknownPricePolicyReject               = "reject"
+	unknownPricePolicyFallbackHighestKnown = "fallback-highest-known"
 )
 
 type tokenRuntime struct {
@@ -68,7 +75,7 @@ type Service struct {
 	legacyKeys      map[string]*tokenRuntime
 	priceRules      []PriceRule
 	events          []Event
-	seen            map[string]struct{}
+	seen            map[string]int
 	limiters        map[string]*limiterState
 	spendDay        map[string]int64
 	spendMonth      map[string]int64
@@ -81,7 +88,7 @@ type Service struct {
 
 func NewService(cfg Config, legacyAPIKeys []string) *Service {
 	normalizeConfig(&cfg)
-	s := &Service{seen: map[string]struct{}{}, limiters: map[string]*limiterState{}, spendDay: map[string]int64{}, spendMonth: map[string]int64{}, spendDayToken: map[string]int64{}, spendMonthToken: map[string]int64{}, ledgerPath: strings.TrimSpace(cfg.LedgerPath)}
+	s := &Service{seen: map[string]int{}, limiters: map[string]*limiterState{}, spendDay: map[string]int64{}, spendMonth: map[string]int64{}, spendDayToken: map[string]int64{}, spendMonthToken: map[string]int64{}, ledgerPath: strings.TrimSpace(cfg.LedgerPath)}
 	s.applyConfigLocked(cfg, legacyAPIKeys)
 	s.connectPostgres()
 	if s.pg != nil {
@@ -289,30 +296,52 @@ func (s *Service) loadLedger() {
 		if err := json.Unmarshal([]byte(line), &event); err != nil || event.EventID == "" {
 			continue
 		}
+		// Events already loaded are in PostgreSQL; replay only backfills missing events and
+		// successes that supersede a stored failed attempt.
+		idx, known := s.seen[event.EventID]
+		replay := !known || supersedesFailedAttempt(s.events[idx], event)
 		s.recordLoadedEventLocked(event)
-		if s.pg != nil {
+		if s.pg != nil && replay {
 			_ = s.appendPostgresLocked(event)
 		}
 	}
 }
 
+// supersedesFailedAttempt reports whether next should replace the recorded
+// event with the same ID. Failover attempts of one request share an event ID;
+// the request is billed by its final successful attempt.
+func supersedesFailedAttempt(recorded, next Event) bool {
+	return recorded.Failed && !next.Failed
+}
+
 func (s *Service) recordLoadedEventLocked(event Event) {
-	if _, exists := s.seen[event.EventID]; exists {
+	if idx, exists := s.seen[event.EventID]; exists {
+		if !supersedesFailedAttempt(s.events[idx], event) {
+			return
+		}
+		s.addLoadedSpendLocked(s.events[idx], -1)
+		s.events[idx] = event
+	} else {
+		s.seen[event.EventID] = len(s.events)
+		s.events = append(s.events, event)
+	}
+	s.addLoadedSpendLocked(event, 1)
+}
+
+func (s *Service) addLoadedSpendLocked(event Event, sign int64) {
+	if event.CustomerCostNanos == nil {
 		return
 	}
-	s.seen[event.EventID] = struct{}{}
-	s.events = append(s.events, event)
-	if event.CustomerCostNanos != nil {
-		now := time.Now().UTC()
-		completed := event.CompletedAt.UTC()
-		if completed.Format("2006-01-02") == now.Format("2006-01-02") {
-			s.spendDay[event.UserID] += *event.CustomerCostNanos
-			s.spendDayToken[tokenSpendKey(event.UserID, event.TokenID)] += *event.CustomerCostNanos
-		}
-		if completed.Format("2006-01") == now.Format("2006-01") {
-			s.spendMonth[event.UserID] += *event.CustomerCostNanos
-			s.spendMonthToken[tokenSpendKey(event.UserID, event.TokenID)] += *event.CustomerCostNanos
-		}
+	cost := sign * *event.CustomerCostNanos
+	now := time.Now().UTC()
+	completed := event.CompletedAt.UTC()
+	if completed.Format("2006-01-02") == now.Format("2006-01-02") {
+		s.spendDay[event.UserID] += cost
+		s.spendDayToken[tokenSpendKey(event.UserID, event.TokenID)] += cost
+	}
+	if completed.Format("2006-01") == now.Format("2006-01") {
+		s.spendMonth[event.UserID] += cost
+		s.spendMonthToken[tokenSpendKey(event.UserID, event.TokenID)] += cost
 	}
 }
 
@@ -344,13 +373,55 @@ func (s *Service) appendPostgresLocked(event Event) error {
 	if err != nil {
 		return err
 	}
+	day := event.CompletedAt.UTC().Format("2006-01-02")
 	if tag.RowsAffected() > 0 {
-		_, err = tx.Exec(ctx, fmt.Sprintf(`INSERT INTO %s.usage_rollup_daily (day, user_id, token_id, requests, customer_cost_nanos, upstream_equivalent_cost_nanos) VALUES ($1,$2,$3,1,$4,$5) ON CONFLICT (day, user_id, token_id) DO UPDATE SET requests = usage_rollup_daily.requests + 1, customer_cost_nanos = usage_rollup_daily.customer_cost_nanos + EXCLUDED.customer_cost_nanos, upstream_equivalent_cost_nanos = usage_rollup_daily.upstream_equivalent_cost_nanos + EXCLUDED.upstream_equivalent_cost_nanos`, schema), event.CompletedAt.UTC().Format("2006-01-02"), event.UserID, event.TokenID, customer, upstream)
-		if err != nil {
+		if err = addUsageRollup(ctx, tx, schema, day, event.UserID, event.TokenID, 1, customer, upstream); err != nil {
 			return err
 		}
+		return tx.Commit(ctx)
+	}
+	if event.Failed {
+		return nil
+	}
+	var oldCustomer, oldUpstream *int64
+	var oldCompletedAt time.Time
+	var oldFailed bool
+	err = tx.QueryRow(ctx, fmt.Sprintf(`SELECT customer_cost_nanos, upstream_equivalent_cost_nanos, completed_at, COALESCE((payload->>'failed')::boolean, false) FROM %s.billing_events WHERE event_id = $1 FOR UPDATE`, schema), event.EventID).Scan(&oldCustomer, &oldUpstream, &oldCompletedAt, &oldFailed)
+	if err != nil {
+		return err
+	}
+	if !oldFailed {
+		return nil
+	}
+	_, err = tx.Exec(ctx, fmt.Sprintf(`UPDATE %s.billing_events SET request_id = $2, user_id = $3, token_id = $4, provider = $5, model = $6, customer_cost_nanos = $7, upstream_equivalent_cost_nanos = $8, requested_at = $9, completed_at = $10, payload = $11 WHERE event_id = $1`, schema), event.EventID, event.RequestID, event.UserID, event.TokenID, event.Provider, event.Model, nullableInt64(event.CustomerCostNanos), nullableInt64(event.UpstreamEquivalentCostNanos), event.RequestedAt, event.CompletedAt, payload)
+	if err != nil {
+		return err
+	}
+	oldCustomerValue, oldUpstreamValue := int64(0), int64(0)
+	if oldCustomer != nil {
+		oldCustomerValue = *oldCustomer
+	}
+	if oldUpstream != nil {
+		oldUpstreamValue = *oldUpstream
+	}
+	oldDay := oldCompletedAt.UTC().Format("2006-01-02")
+	if oldDay == day {
+		err = addUsageRollup(ctx, tx, schema, day, event.UserID, event.TokenID, 0, customer-oldCustomerValue, upstream-oldUpstreamValue)
+	} else {
+		err = addUsageRollup(ctx, tx, schema, oldDay, event.UserID, event.TokenID, -1, -oldCustomerValue, -oldUpstreamValue)
+		if err == nil {
+			err = addUsageRollup(ctx, tx, schema, day, event.UserID, event.TokenID, 1, customer, upstream)
+		}
+	}
+	if err != nil {
+		return err
 	}
 	return tx.Commit(ctx)
+}
+
+func addUsageRollup(ctx context.Context, tx pgx.Tx, schema, day, userID, tokenID string, requests, customer, upstream int64) error {
+	_, err := tx.Exec(ctx, fmt.Sprintf(`INSERT INTO %s.usage_rollup_daily (day, user_id, token_id, requests, customer_cost_nanos, upstream_equivalent_cost_nanos) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (day, user_id, token_id) DO UPDATE SET requests = usage_rollup_daily.requests + EXCLUDED.requests, customer_cost_nanos = usage_rollup_daily.customer_cost_nanos + EXCLUDED.customer_cost_nanos, upstream_equivalent_cost_nanos = usage_rollup_daily.upstream_equivalent_cost_nanos + EXCLUDED.upstream_equivalent_cost_nanos`, schema), day, userID, tokenID, requests, customer, upstream)
+	return err
 }
 
 func nullableInt64(v *int64) any {
@@ -394,10 +465,7 @@ func normalizeConfig(cfg *Config) {
 	if cfg.Currency == "" {
 		cfg.Currency = "USD"
 	}
-	cfg.UnknownPricePolicy = strings.TrimSpace(cfg.UnknownPricePolicy)
-	if cfg.UnknownPricePolicy == "" {
-		cfg.UnknownPricePolicy = "record-unpriced"
-	}
+	cfg.UnknownPricePolicy = normalizeUnknownPricePolicy(cfg.UnknownPricePolicy)
 	if cfg.Token.PepperEnv == "" {
 		cfg.Token.PepperEnv = "BILLING_TOKEN_PEPPER"
 	}
@@ -415,6 +483,19 @@ func normalizeConfig(cfg *Config) {
 	}
 	if strings.TrimSpace(cfg.PriceBook.Version) == "" {
 		cfg.PriceBook.Version = defaultPriceBookVersion
+	}
+}
+
+func normalizeUnknownPricePolicy(policy string) string {
+	switch strings.ToLower(strings.TrimSpace(policy)) {
+	case "", unknownPricePolicyRecordUnpriced, "record", "observe":
+		return unknownPricePolicyRecordUnpriced
+	case unknownPricePolicyReject, "deny", "block", "fail", "fail-closed":
+		return unknownPricePolicyReject
+	case unknownPricePolicyFallbackHighestKnown, "fallback", "fallback-highest", "highest-known":
+		return unknownPricePolicyFallbackHighestKnown
+	default:
+		return unknownPricePolicyRecordUnpriced
 	}
 }
 
@@ -519,6 +600,10 @@ func (s *Service) GuardMiddleware() gin.HandlerFunc {
 			c.Next()
 			return
 		}
+		if err := s.rejectUnknownPricedRequestModel(c); err != nil {
+			c.AbortWithStatusJSON(http.StatusPaymentRequired, gin.H{"error": gin.H{"type": "billing_error", "code": "unpriced_model", "message": err.Error()}})
+			return
+		}
 		lease, err := s.acquire(p)
 		if err != nil {
 			c.Header("Retry-After", "60")
@@ -528,6 +613,41 @@ func (s *Service) GuardMiddleware() gin.HandlerFunc {
 		defer s.release(lease)
 		c.Next()
 	}
+}
+
+func (s *Service) rejectUnknownPricedRequestModel(c *gin.Context) error {
+	if s == nil || c == nil || c.Request == nil || strings.TrimSpace(s.cfg.UnknownPricePolicy) != unknownPricePolicyReject {
+		return nil
+	}
+	if c.Request.Body == nil || c.Request.Body == http.NoBody {
+		return nil
+	}
+	method := strings.ToUpper(strings.TrimSpace(c.Request.Method))
+	if method != http.MethodPost && method != http.MethodPut && method != http.MethodPatch {
+		return nil
+	}
+	body, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		return nil
+	}
+	c.Request.Body = io.NopCloser(bytes.NewReader(body))
+	var req struct {
+		Model string `json:"model"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		return nil
+	}
+	model := strings.TrimSpace(req.Model)
+	if model == "" {
+		return nil
+	}
+	s.mu.Lock()
+	_, ok := s.resolvePriceLocked("", model)
+	s.mu.Unlock()
+	if ok {
+		return nil
+	}
+	return fmt.Errorf("billing price is not configured for model %q", model)
 }
 
 type lease struct {
@@ -651,15 +771,29 @@ func (s *Service) HandleUsage(ctx context.Context, record coreusage.Record) {
 func (s *Service) priceAndRecord(e *Event) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, exists := s.seen[e.EventID]; exists {
+	idx, exists := s.seen[e.EventID]
+	if exists && !supersedesFailedAttempt(s.events[idx], *e) {
 		return
 	}
 	rule, ok := s.resolvePriceLocked(e.Provider, e.Model)
+	fallback := false
+	if !ok && strings.TrimSpace(s.cfg.UnknownPricePolicy) == unknownPricePolicyFallbackHighestKnown {
+		if fallbackRule, okFallback := s.resolveFallbackPriceLocked(); okFallback {
+			rule = fallbackRule
+			ok = true
+			fallback = true
+		}
+	}
 	if ok {
 		cost := e.InputUncachedTokens*rule.InputUncachedNanosPerToken + e.InputCacheReadTokens*rule.InputCacheReadNanosPerToken + e.InputCacheWrite5mTokens*rule.InputCacheWrite5mNanosPerToken + e.InputCacheWrite1hTokens*rule.InputCacheWrite1hNanosPerToken + e.OutputTextTokens*rule.OutputTextNanosPerToken + e.OutputReasoningTokens*rule.OutputReasoningNanosPerToken
 		e.PriceBookVersion = s.cfg.PriceBook.Version
 		e.PriceRuleID = rule.ID
 		snap := rule
+		if fallback {
+			e.BillingQuality = "fallback"
+			e.PriceRuleID = "fallback-highest-known:" + rule.ID
+			snap.ID = e.PriceRuleID
+		}
 		e.PriceSnapshot = &snap
 		e.UpstreamEquivalentCostNanos = &cost
 		customer := int64(0)
@@ -670,18 +804,29 @@ func (s *Service) priceAndRecord(e *Event) {
 	} else {
 		e.BillingQuality = "unpriced"
 	}
-	s.seen[e.EventID] = struct{}{}
-	s.events = append(s.events, *e)
+	if exists {
+		s.addSpendLocked(s.events[idx], -1)
+		s.events[idx] = *e
+	} else {
+		s.seen[e.EventID] = len(s.events)
+		s.events = append(s.events, *e)
+	}
 	if err := s.appendLedgerLocked(*e); err != nil {
 		fmt.Fprintf(os.Stderr, "billing ledger append failed: %v\n", err)
 	}
-	if e.CustomerCostNanos != nil {
-		s.spendDay[e.UserID] += *e.CustomerCostNanos
-		s.spendMonth[e.UserID] += *e.CustomerCostNanos
-		key := tokenSpendKey(e.UserID, e.TokenID)
-		s.spendDayToken[key] += *e.CustomerCostNanos
-		s.spendMonthToken[key] += *e.CustomerCostNanos
+	s.addSpendLocked(*e, 1)
+}
+
+func (s *Service) addSpendLocked(e Event, sign int64) {
+	if e.CustomerCostNanos == nil {
+		return
 	}
+	cost := sign * *e.CustomerCostNanos
+	s.spendDay[e.UserID] += cost
+	s.spendMonth[e.UserID] += cost
+	key := tokenSpendKey(e.UserID, e.TokenID)
+	s.spendDayToken[key] += cost
+	s.spendMonthToken[key] += cost
 }
 
 func tokenSpendKey(userID, tokenID string) string {
@@ -692,7 +837,7 @@ func (s *Service) resolvePriceLocked(provider, model string) (PriceRule, bool) {
 	p := strings.ToLower(strings.TrimSpace(provider))
 	m := strings.ToLower(strings.TrimSpace(model))
 	for _, r := range s.priceRules {
-		if strings.EqualFold(r.BillingProvider, p) && strings.EqualFold(r.Model, m) {
+		if p != "" && strings.EqualFold(r.BillingProvider, p) && strings.EqualFold(r.Model, m) {
 			return r, true
 		}
 	}
@@ -702,6 +847,19 @@ func (s *Service) resolvePriceLocked(provider, model string) (PriceRule, bool) {
 		}
 	}
 	return PriceRule{}, false
+}
+
+func (s *Service) resolveFallbackPriceLocked() (PriceRule, bool) {
+	var best PriceRule
+	var bestScore int64
+	for _, r := range s.priceRules {
+		score := r.InputUncachedNanosPerToken + r.InputCacheReadNanosPerToken + r.InputCacheWrite5mNanosPerToken + r.InputCacheWrite1hNanosPerToken + r.OutputTextNanosPerToken + r.OutputReasoningNanosPerToken
+		if best.ID == "" || score > bestScore {
+			best = r
+			bestScore = score
+		}
+	}
+	return best, best.ID != ""
 }
 
 func (s *Service) Summary() Summary {
@@ -742,6 +900,35 @@ func (s *Service) Events() []Event {
 	sort.Slice(out, func(i, j int) bool { return out[i].CompletedAt.After(out[j].CompletedAt) })
 	return out
 }
+
+func (s *Service) EventsAfter(afterCompletedAt time.Time, afterEventID string, limit int) []Event {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]Event, 0, len(s.events))
+	afterEventID = strings.TrimSpace(afterEventID)
+	for _, event := range s.events {
+		if !afterCompletedAt.IsZero() {
+			if event.CompletedAt.Before(afterCompletedAt) {
+				continue
+			}
+			if event.CompletedAt.Equal(afterCompletedAt) && strings.TrimSpace(event.EventID) <= afterEventID {
+				continue
+			}
+		}
+		out = append(out, event)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].CompletedAt.Equal(out[j].CompletedAt) {
+			return out[i].CompletedAt.Before(out[j].CompletedAt)
+		}
+		return out[i].EventID < out[j].EventID
+	})
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out
+}
+
 func (s *Service) EventByRequestID(id string) (Event, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

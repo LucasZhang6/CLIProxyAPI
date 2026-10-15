@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -45,11 +46,17 @@ type config struct {
 }
 
 type agent struct {
-	cfg         config
-	s3          *minio.Client
-	host        string
-	client      *http.Client
-	billingSeen map[string]struct{}
+	cfg           config
+	s3            *minio.Client
+	host          string
+	client        *http.Client
+	billingSeen   map[string]struct{}
+	billingCursor billingCursor
+}
+
+type billingCursor struct {
+	CompletedAt string `json:"completed_at"`
+	EventID     string `json:"event_id"`
 }
 
 func main() {
@@ -82,6 +89,7 @@ func main() {
 			fatal(fmt.Errorf("create billing spool dir: %w", err))
 		}
 		a.loadBillingSeen()
+		a.loadBillingCursor()
 		go a.runUsagePoller(ctx)
 		go a.runBillingExporter(ctx)
 	} else {
@@ -222,6 +230,8 @@ func (a *agent) uploadRaw(ctx context.Context) error {
 	return nil
 }
 
+const activeMainLogName = "main.log"
+
 func settledLogFiles(dir string, settle time.Duration, maxFiles int) ([]string, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -234,6 +244,12 @@ func settledLogFiles(dir string, settle time.Duration, maxFiles int) ([]string, 
 	files := make([]string, 0)
 	for _, entry := range entries {
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".log") {
+			continue
+		}
+		// The proxy keeps main.log open across quiet periods such as restarts; deleting it
+		// leaves the proxy writing to an unlinked file until lumberjack rotates it.
+		// Rotated main-<timestamp>.log files are still uploaded.
+		if entry.Name() == activeMainLogName {
 			continue
 		}
 		info, err := entry.Info()
@@ -449,12 +465,15 @@ func (a *agent) pollBillingOnce(ctx context.Context) {
 		return
 	}
 	wrote := 0
+	var lastCursor billingCursor
 	for _, rec := range records {
-		id := billingEventID(rec)
-		if id == "" {
+		cursor := billingEventCursor(rec)
+		key := billingSeenKey(rec)
+		if cursor.EventID == "" || key == "" {
 			continue
 		}
-		if _, ok := a.billingSeen[id]; ok {
+		if _, ok := a.billingSeen[key]; ok {
+			lastCursor = cursor
 			continue
 		}
 		if _, errWrite := f.Write(rec); errWrite != nil {
@@ -462,8 +481,9 @@ func (a *agent) pollBillingOnce(ctx context.Context) {
 			break
 		}
 		_, _ = f.Write([]byte("\n"))
-		a.billingSeen[id] = struct{}{}
-		a.persistBillingSeen(id)
+		a.billingSeen[key] = struct{}{}
+		a.persistBillingSeen(key)
+		lastCursor = cursor
 		wrote++
 	}
 	if err := f.Sync(); err != nil {
@@ -472,14 +492,24 @@ func (a *agent) pollBillingOnce(ctx context.Context) {
 	if err := f.Close(); err != nil {
 		logf("close billing spool failed: %v", err)
 	}
+	if lastCursor.EventID != "" {
+		a.billingCursor = lastCursor
+		a.persistBillingCursor(lastCursor)
+	}
 	if wrote > 0 {
 		logf("spooled %d billing event(s)", wrote)
 	}
 }
 
 func (a *agent) fetchBillingEvents(ctx context.Context) ([][]byte, error) {
-	url := a.cfg.BaseURL + "/v0/management/billing/usage/export"
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	exportURL := fmt.Sprintf("%s/v0/management/billing/usage/export?limit=%d", a.cfg.BaseURL, a.cfg.PollBatch)
+	if strings.TrimSpace(a.billingCursor.CompletedAt) != "" {
+		exportURL += "&after_completed_at=" + url.QueryEscape(strings.TrimSpace(a.billingCursor.CompletedAt))
+	}
+	if strings.TrimSpace(a.billingCursor.EventID) != "" {
+		exportURL += "&after_event_id=" + url.QueryEscape(strings.TrimSpace(a.billingCursor.EventID))
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, exportURL, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -511,17 +541,38 @@ func (a *agent) fetchBillingEvents(ctx context.Context) ([][]byte, error) {
 	return out, nil
 }
 
-func billingEventID(raw []byte) string {
+func billingEventID(raw []byte) string { return billingEventCursor(raw).EventID }
+
+func billingEventCursor(raw []byte) billingCursor {
+	var obj struct {
+		EventID     string `json:"event_id"`
+		CompletedAt string `json:"completed_at"`
+	}
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return billingCursor{}
+	}
+	return billingCursor{CompletedAt: strings.TrimSpace(obj.CompletedAt), EventID: strings.TrimSpace(obj.EventID)}
+}
+
+// billingSeenKey keeps failed attempts in a separate dedupe slot so the router's
+// successful failover attempt, which reuses the event ID, is still exported.
+func billingSeenKey(raw []byte) string {
 	var obj struct {
 		EventID string `json:"event_id"`
+		Failed  bool   `json:"failed"`
 	}
 	if err := json.Unmarshal(raw, &obj); err != nil {
 		return ""
 	}
-	return strings.TrimSpace(obj.EventID)
+	id := strings.TrimSpace(obj.EventID)
+	if id == "" || !obj.Failed {
+		return id
+	}
+	return id + ":failed"
 }
 
-func (a *agent) billingSeenPath() string { return filepath.Join(a.cfg.BillingSpoolDir, ".seen") }
+func (a *agent) billingSeenPath() string   { return filepath.Join(a.cfg.BillingSpoolDir, ".seen") }
+func (a *agent) billingCursorPath() string { return filepath.Join(a.cfg.BillingSpoolDir, ".cursor") }
 
 func (a *agent) loadBillingSeen() {
 	data, err := os.ReadFile(a.billingSeenPath())
@@ -547,6 +598,38 @@ func (a *agent) persistBillingSeen(id string) {
 	}
 	_, _ = f.WriteString(id + "\n")
 	_ = f.Close()
+}
+
+func (a *agent) loadBillingCursor() {
+	data, err := os.ReadFile(a.billingCursorPath())
+	if err != nil {
+		return
+	}
+	var cursor billingCursor
+	if err := json.Unmarshal(data, &cursor); err != nil {
+		return
+	}
+	a.billingCursor = billingCursor{CompletedAt: strings.TrimSpace(cursor.CompletedAt), EventID: strings.TrimSpace(cursor.EventID)}
+}
+
+func (a *agent) persistBillingCursor(cursor billingCursor) {
+	if strings.TrimSpace(cursor.EventID) == "" {
+		return
+	}
+	data, err := json.Marshal(cursor)
+	if err != nil {
+		logf("marshal billing cursor failed: %v", err)
+		return
+	}
+	path := a.billingCursorPath()
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, append(data, '\n'), 0o644); err != nil {
+		logf("write billing cursor failed: %v", err)
+		return
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		logf("rename billing cursor failed: %v", err)
+	}
 }
 
 func (a *agent) flushBillingStale(now time.Time, includeCurrent bool) {

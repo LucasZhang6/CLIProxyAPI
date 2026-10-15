@@ -149,6 +149,12 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if strings.TrimSpace(oldCfg.Codex.StreamBootstrapTimeout) != strings.TrimSpace(newCfg.Codex.StreamBootstrapTimeout) {
 		changes = append(changes, fmt.Sprintf("codex.stream-bootstrap-timeout: %s -> %s", strings.TrimSpace(oldCfg.Codex.StreamBootstrapTimeout), strings.TrimSpace(newCfg.Codex.StreamBootstrapTimeout)))
 	}
+	if strings.TrimSpace(oldCfg.Codex.StreamBootstrapFirstTurnTimeout) != strings.TrimSpace(newCfg.Codex.StreamBootstrapFirstTurnTimeout) {
+		changes = append(changes, fmt.Sprintf("codex.stream-bootstrap-first-turn-timeout: %s -> %s", strings.TrimSpace(oldCfg.Codex.StreamBootstrapFirstTurnTimeout), strings.TrimSpace(newCfg.Codex.StreamBootstrapFirstTurnTimeout)))
+	}
+	if strings.TrimSpace(oldCfg.Codex.StreamBootstrapFirstTurnWindow) != strings.TrimSpace(newCfg.Codex.StreamBootstrapFirstTurnWindow) {
+		changes = append(changes, fmt.Sprintf("codex.stream-bootstrap-first-turn-window: %s -> %s", strings.TrimSpace(oldCfg.Codex.StreamBootstrapFirstTurnWindow), strings.TrimSpace(newCfg.Codex.StreamBootstrapFirstTurnWindow)))
+	}
 	if oldCfg.Codex.OptimizeMultiAgentV2 != newCfg.Codex.OptimizeMultiAgentV2 {
 		changes = append(changes, fmt.Sprintf("codex.optimize-multi-agent-v2: %t -> %t", oldCfg.Codex.OptimizeMultiAgentV2, newCfg.Codex.OptimizeMultiAgentV2))
 	}
@@ -185,6 +191,8 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if oldCfg.Routing.Strategy != newCfg.Routing.Strategy {
 		changes = append(changes, fmt.Sprintf("routing.strategy: %s -> %s", oldCfg.Routing.Strategy, newCfg.Routing.Strategy))
 	}
+	changes = appendOptionalIntChange(changes, "routing.quota-aware.weekly-remaining-min-percent", oldCfg.Routing.QuotaAware.WeeklyRemainingMinPercent, newCfg.Routing.QuotaAware.WeeklyRemainingMinPercent)
+	changes = appendOptionalIntChange(changes, "routing.quota-aware.spread-band-percent", oldCfg.Routing.QuotaAware.SpreadBandPercent, newCfg.Routing.QuotaAware.SpreadBandPercent)
 	if !reflect.DeepEqual(oldCfg.Payload, newCfg.Payload) {
 		changes = appendPayloadConfigChanges(changes, oldCfg.Payload, newCfg.Payload)
 	}

@@ -663,8 +663,16 @@ func (s *RoundRobinSelector) ensureRotationKey(key string, limit int) {
 // Credentials below WeeklyRemainingMinPercent are skipped when at least one healthy
 // candidate with known quota is above the threshold. Unknown quota candidates remain
 // eligible as a fallback after known healthy quota candidates.
+//
+// SpreadBandPercent rotates picks across every candidate whose score is within that many
+// percentage points of the best one, so near-equal credentials share new sessions instead
+// of the single highest one absorbing all of them. Zero always picks the highest.
 type QuotaAwareSelector struct {
 	WeeklyRemainingMinPercent int
+	SpreadBandPercent         int
+
+	mu         sync.Mutex
+	lastPicked map[string]string
 }
 
 type quotaAwareCandidate struct {
@@ -681,9 +689,15 @@ func (s *QuotaAwareSelector) Pick(ctx context.Context, provider, model string, o
 		return nil, err
 	}
 	available = preferCodexWebsocketAuths(ctx, provider, available)
+	return s.pickAvailable(provider+":"+canonicalModelKey(model), available), nil
+}
+
+// pickAvailable applies the quota ordering and band rotation to already-available auths.
+// rotationKey scopes the round-robin cursor, typically provider and model.
+func (s *QuotaAwareSelector) pickAvailable(rotationKey string, available []*Auth) *Auth {
 	candidates := quotaAwareCandidates(available)
 	if len(candidates) == 0 {
-		return nil, nil
+		return nil
 	}
 	threshold := s.WeeklyRemainingMinPercent
 	if threshold < 0 {
@@ -715,7 +729,37 @@ func (s *QuotaAwareSelector) Pick(ctx context.Context, provider, model string, o
 		}
 		return left.auth.ID < right.auth.ID
 	})
-	return candidates[0].auth, nil
+	band := s.SpreadBandPercent
+	if band > 100 {
+		band = 100
+	}
+	if band <= 0 || len(candidates) == 1 {
+		return candidates[0].auth
+	}
+	floor := quotaAwareCandidateScore(candidates[0]) - float64(band)
+	inBand := make([]*Auth, 0, len(candidates))
+	for _, candidate := range candidates {
+		if quotaAwareCandidateScore(candidate) < floor {
+			break
+		}
+		inBand = append(inBand, candidate.auth)
+	}
+	if len(inBand) == 1 {
+		return inBand[0]
+	}
+	sort.Slice(inBand, func(i, j int) bool { return inBand[i].ID < inBand[j].ID })
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.lastPicked == nil {
+		s.lastPicked = make(map[string]string)
+	}
+	if _, ok := s.lastPicked[rotationKey]; !ok && len(s.lastPicked) >= 4096 {
+		s.lastPicked = make(map[string]string)
+	}
+	picked := inBand[successorIndex(inBand, s.lastPicked[rotationKey])]
+	s.lastPicked[rotationKey] = picked.ID
+	return picked
 }
 
 func quotaAwareCandidates(auths []*Auth) []quotaAwareCandidate {
@@ -731,21 +775,25 @@ func quotaAwareCandidates(auths []*Auth) []quotaAwareCandidate {
 }
 
 func quotaAwareCandidateScore(candidate quotaAwareCandidate) float64 {
+	base := -1.0
 	if candidate.known {
-		return candidate.remaining
+		base = candidate.remaining
+	} else {
+		switch quotaAwarePlanRank(candidate.auth) {
+		case 4:
+			base = 90
+		case 3:
+			base = 75
+		case 2:
+			base = 50
+		case 1:
+			base = 10
+		}
 	}
-	switch quotaAwarePlanRank(candidate.auth) {
-	case 4:
-		return 90
-	case 3:
-		return 75
-	case 2:
-		return 50
-	case 1:
-		return 10
-	default:
-		return -1
+	if candidate.auth != nil {
+		base -= candidate.auth.overloadScorePenalty(time.Now())
 	}
+	return base
 }
 
 func quotaAwarePlanRank(auth *Auth) int {
@@ -1300,7 +1348,13 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 				return auth, nil
 			}
 		}
-		// Cached auth not available or no longer quota-eligible, reselect via fallback selector
+		// Cached auth not available or no longer quota-eligible. Prefer a credential
+		// that recently served this session so the prompt cache stays warm.
+		if auth := s.pickWarmPreferred(available, cacheKey, fallbackKey); auth != nil {
+			bind(auth.ID)
+			entry.Infof("session-affinity: cache hit but auth unavailable, warm reselected | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
+			return auth, nil
+		}
 		auth, err := s.fallback.Pick(ctx, provider, model, opts, fallbackAuths)
 		if err != nil {
 			return nil, err
@@ -1331,6 +1385,16 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		}
 	}
 
+	if auth := s.pickWarmPreferred(available, cacheKey, fallbackKey); auth != nil {
+		bind(auth.ID)
+		if isFork && fallbackID != "" {
+			entry.Infof("session-affinity: fork bound to warm auth | session=%s parent=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), truncateSessionID(fallbackID), auth.ID, provider, model)
+		} else {
+			entry.Infof("session-affinity: warm cache hit, rebound | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
+		}
+		return auth, nil
+	}
+
 	auth, err := s.fallback.Pick(ctx, provider, model, opts, fallbackAuths)
 	if err != nil {
 		return nil, err
@@ -1345,6 +1409,43 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		entry.Infof("session-affinity: cache miss, new binding | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 	}
 	return auth, nil
+}
+
+// pickWarmPreferred returns the most recently successful credential for the
+// session that is still available and quota-eligible. Callers use this when the
+// sticky binding cannot be reused so failover does not jump to a cold account.
+func (s *SessionAffinitySelector) pickWarmPreferred(available []*Auth, cacheKeys ...string) *Auth {
+	if s == nil || s.cache == nil || len(available) == 0 {
+		return nil
+	}
+	byID := make(map[string]*Auth, len(available))
+	for _, auth := range available {
+		if auth == nil || auth.ID == "" {
+			continue
+		}
+		byID[auth.ID] = auth
+	}
+	seen := make(map[string]struct{})
+	for _, key := range cacheKeys {
+		if key == "" {
+			continue
+		}
+		for _, authID := range s.cache.WarmAuthIDs(key) {
+			if _, ok := seen[authID]; ok {
+				continue
+			}
+			seen[authID] = struct{}{}
+			auth := byID[authID]
+			if auth == nil {
+				continue
+			}
+			if !quotaAwareCachedAuthAllowed(s.fallback, auth, available) {
+				continue
+			}
+			return auth
+		}
+	}
+	return nil
 }
 
 func (s *SessionAffinitySelector) pickLCP(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth, entry *log.Entry) (*Auth, bool, error) {
@@ -1775,8 +1876,10 @@ func (s *SessionAffinitySelector) OnResult(res Result) {
 	}
 	if res.Success {
 		s.cache.Touch(cacheKey, res.AuthID)
+		s.cache.RecordWarm(cacheKey, res.AuthID)
 		if fallbackKey != "" {
 			s.cache.Touch(fallbackKey, res.AuthID)
+			s.cache.RecordWarm(fallbackKey, res.AuthID)
 		}
 		return
 	}
@@ -1784,6 +1887,16 @@ func (s *SessionAffinitySelector) OnResult(res Result) {
 	s.cache.CompareAndDelete(cacheKey, res.AuthID)
 	if fallbackKey != "" {
 		s.cache.CompareAndDelete(fallbackKey, res.AuthID)
+	}
+	// Capacity shedding unbinds the sticky credential so another account can
+	// serve this attempt, but the account still holds the prompt cache. Keep it
+	// in the warm MRU so the next binding prefers it once it is available again.
+	if isCapacitySheddingResultError(res.Error) {
+		return
+	}
+	s.cache.ForgetWarm(cacheKey, res.AuthID)
+	if fallbackKey != "" {
+		s.cache.ForgetWarm(fallbackKey, res.AuthID)
 	}
 }
 

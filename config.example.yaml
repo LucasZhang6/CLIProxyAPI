@@ -14,8 +14,15 @@ tls:
 # Management API settings
 remote-management:
   # Whether to allow remote (non-localhost) management access.
-  # When false, only localhost can access management endpoints (a key is still required).
+  # When false, only localhost and allowed-cidrs can access management endpoints.
   allow-remote: false
+  # Optional exact IPs or CIDRs allowed when allow-remote is false.
+  # Example: ["198.51.100.10/32", "10.0.0.0/8"]
+  allowed-cidrs: []
+  # Reverse-proxy peers allowed to supply the real client IP through
+  # X-Forwarded-For. Keep this limited to your ALB/VPN proxy subnets.
+  # Example: ["172.31.0.0/16"]
+  trusted-proxy-cidrs: []
 
   # Management key. If a plaintext value is provided here, it will be hashed on startup.
   # All management requests (even from localhost) require this key.
@@ -266,6 +273,9 @@ routing:
   # skipped when at least one known healthy candidate remains above the threshold.
   quota-aware:
     weekly-remaining-min-percent: 20
+    # Rotate new sessions across credentials whose weekly remaining quota is within this many
+    # percentage points of the highest one. 0 (default) always picks the single highest.
+    # spread-band-percent: 10
 
 # Codex provider behavior.
 codex:
@@ -343,6 +353,15 @@ codex:
   # is applied, and buffering relies purely on the 48-frame and 1MB byte budget.
   # Default: "0" (unlimited)
   stream-bootstrap-timeout: "0"
+  # Optional longer hold for requests that open a conversation (no previous_response_id and no
+  # replayed assistant, reasoning, or tool items). Upstream capacity shedding often queues such
+  # requests and rejects them after stream-bootstrap-timeout; holding longer lets that rejection
+  # still fail over to another credential. Ignored unless longer than a positive
+  # stream-bootstrap-timeout.
+  # stream-bootstrap-first-turn-timeout: "60s"
+  # Bounds the first-turn extension: a hold beyond stream-bootstrap-timeout must end within this
+  # duration of the request start, so later attempts fall back to stream-bootstrap-timeout.
+  # stream-bootstrap-first-turn-window: "90s"
   # When true, optimize Codex Desktop, codex-tui, and codex_cli_rs requests for multi-agent v2.
   # This refreshes Codex spawn_agent model details, removes message parameter encryption,
   # normalizes encrypted agent_message content for Codex, and converts agent_message input

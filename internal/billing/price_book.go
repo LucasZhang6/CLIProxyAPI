@@ -18,6 +18,12 @@ func defaultPriceRules(pb PriceBookConfig) []PriceRule {
 var defaultPriceBookRules = []PriceRule{
 	// OpenAI standard short-context text pricing.
 	priceRule("openai-gpt-6-astra-standard-20260921", "openai", "gpt-6-astra", 10000, 1000, 12500, 50000),
+	// GPT-6 family entries use the conservative GPT-6 Astra text-equivalent
+	// rate until an explicit public SKU price is configured by operators.
+	priceRule("openai-gpt-6-sol-standard-20261008", "openai", "gpt-6-sol", 10000, 1000, 12500, 50000),
+	priceRule("openai-gpt-6.1-sol-standard-20261008", "openai", "gpt-6.1-sol", 10000, 1000, 12500, 50000),
+	priceRule("openai-gpt-6-luna-standard-20261008", "openai", "gpt-6-luna", 10000, 1000, 12500, 50000),
+	priceRule("openai-codex-auto-review-standard-20261008", "openai", "codex-auto-review", 10000, 1000, 12500, 50000),
 	priceRule("openai-gpt-5.6-sol-standard-20260921", "openai", "gpt-5.6-sol", 4000, 400, 5000, 20000),
 	priceRule("openai-gpt-5.6-terra-standard-20260921", "openai", "gpt-5.6-terra", 2000, 200, 2500, 12000),
 	priceRule("openai-gpt-5.6-luna-standard-20260921", "openai", "gpt-5.6-luna", 200, 20, 250, 1200),

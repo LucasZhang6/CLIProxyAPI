@@ -29,6 +29,10 @@ func TestDefaultPriceBookMainstreamModels(t *testing.T) {
 		output    int64
 	}{
 		"claude-opus-4-5-20251101":   {"claude", 5000, 500, 6250, 25000},
+		"gpt-6-sol":                  {"openai", 10000, 1000, 12500, 50000},
+		"gpt-6.1-sol":                {"openai", 10000, 1000, 12500, 50000},
+		"gpt-6-luna":                 {"openai", 10000, 1000, 12500, 50000},
+		"codex-auto-review":          {"openai", 10000, 1000, 12500, 50000},
 		"gpt-5.6-sol":                {"openai", 4000, 400, 5000, 20000},
 		"gpt-5.6-terra":              {"openai", 2000, 200, 2500, 12000},
 		"gpt-5.6-luna":               {"openai", 200, 20, 250, 1200},
@@ -51,8 +55,8 @@ func TestDefaultPriceBookMainstreamModels(t *testing.T) {
 		}
 	}
 
-	if len(rules) != 88 {
-		t.Fatalf("default rule coverage = %d, want 88 explicit model IDs", len(rules))
+	if len(rules) != 92 {
+		t.Fatalf("default rule coverage = %d, want 92 explicit model IDs", len(rules))
 	}
 }
 
@@ -71,6 +75,23 @@ func TestDefaultPriceBookUnknownModelRemainsUnpriced(t *testing.T) {
 	events := svc.Events()
 	if len(events) != 1 || events[0].BillingQuality != "unpriced" || events[0].CustomerCostNanos != nil || events[0].PriceRuleID != "" {
 		t.Fatalf("event for unknown model = %+v, want unpriced with no price rule", events)
+	}
+}
+
+func TestUnknownPricePolicyFallbackHighestKnownChargesUnknownModel(t *testing.T) {
+	svc := NewService(Config{Enabled: true, Mode: "enforce-hard", UnknownPricePolicy: "fallback-highest-known", LedgerPath: t.TempDir() + "/billing.jsonl", Token: TokenConfig{LegacyAPIKeys: "observe"}}, []string{"sk-test"})
+	p, ok := svc.AuthenticateToken("sk-test")
+	if !ok {
+		t.Fatal("legacy token did not authenticate")
+	}
+
+	svc.HandleUsage(WithPrincipal(context.Background(), p), coreusage.Record{RequestID: "fallback-model", Provider: "codex", Model: "future-model", RequestedAt: time.Now(), Detail: coreusage.Detail{InputTokens: 10, OutputTokens: 5, TotalTokens: 15}})
+	e, ok := svc.EventByRequestID("fallback-model")
+	if !ok {
+		t.Fatal("missing fallback event")
+	}
+	if e.CustomerCostNanos == nil || *e.CustomerCostNanos <= 0 || e.BillingQuality != "fallback" || e.PriceRuleID == "" {
+		t.Fatalf("fallback event = %+v, want charged fallback", e)
 	}
 }
 

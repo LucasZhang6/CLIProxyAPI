@@ -66,6 +66,10 @@ type Result struct {
 	// observed watermark. Count-tokens requests reuse the credential but are not
 	// generation traffic; their response headers are not a generation snapshot.
 	SkipQuotaObservation bool
+	// RecordRequestStatistics counts this result even while the request can still
+	// fail over to another credential. Failures after the response is committed
+	// set it, because that outcome is the one the client sees.
+	RecordRequestStatistics bool
 }
 
 // Selector chooses an auth candidate for execution.

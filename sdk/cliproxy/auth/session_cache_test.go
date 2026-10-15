@@ -168,3 +168,32 @@ func TestSessionCache_StopNilChannelNoPanic(t *testing.T) {
 	zeroCache := &SessionCache{}
 	zeroCache.Stop()
 }
+
+func TestSessionCache_WarmAuthsPreferMostRecentAndSurviveUnbind(t *testing.T) {
+	t.Parallel()
+
+	cache := NewSessionCache(time.Minute)
+	defer cache.Stop()
+
+	cache.RecordWarm("sess", "auth-a")
+	cache.RecordWarm("sess", "auth-b")
+	cache.RecordWarm("sess", "auth-a")
+	if got := cache.WarmAuthIDs("sess"); len(got) < 2 || got[0] != "auth-a" || got[1] != "auth-b" {
+		t.Fatalf("WarmAuthIDs() = %v, want MRU [auth-a auth-b]", got)
+	}
+
+	cache.Set("sess", "auth-a")
+	if !cache.CompareAndDelete("sess", "auth-a") {
+		t.Fatal("CompareAndDelete() = false")
+	}
+	if _, ok := cache.Get("sess"); ok {
+		t.Fatal("sticky binding should be cleared")
+	}
+	if got := cache.WarmAuthIDs("sess"); len(got) == 0 || got[0] != "auth-a" {
+		t.Fatalf("WarmAuthIDs() after unbind = %v, want auth-a retained until ForgetWarm", got)
+	}
+	cache.ForgetWarm("sess", "auth-a")
+	if got := cache.WarmAuthIDs("sess"); len(got) != 1 || got[0] != "auth-b" {
+		t.Fatalf("WarmAuthIDs() after ForgetWarm = %v, want [auth-b]", got)
+	}
+}

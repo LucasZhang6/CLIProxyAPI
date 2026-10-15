@@ -102,7 +102,10 @@ type Auth struct {
 	Failed  int64 `json:"-"`
 
 	recentRequests recentRequestRing `json:"-"`
-	indexAssigned  bool              `json:"-"`
+	// recentOverloads tracks capacity-shedding failures used only for soft score
+	// demotion in quota-aware selection. It is not a cooldown.
+	recentOverloads recentOverloadRing `json:"-"`
+	indexAssigned   bool               `json:"-"`
 }
 
 const (
@@ -161,6 +164,24 @@ type recentRequestBucket struct {
 
 type recentRequestRing struct {
 	buckets [recentRequestBucketCount]recentRequestBucket
+}
+
+const (
+	// recentOverloadWindow is how long a capacity rejection continues to lower an
+	// account's quota-aware score after the hard cooldown has already expired.
+	recentOverloadWindow = 5 * time.Minute
+	// recentOverloadPenalty is subtracted from the quota-aware score for each
+	// capacity rejection still inside the window. Cap keeps a healthy high-quota
+	// account selectable when every peer was also just rejected.
+	recentOverloadPenalty     = 15.0
+	recentOverloadPenaltyCap  = 40.0
+	recentOverloadRingCapacity = 8
+)
+
+type recentOverloadRing struct {
+	times [recentOverloadRingCapacity]time.Time
+	next  int
+	count int
 }
 
 type RecentRequestBucket struct {
@@ -258,6 +279,38 @@ func (a *Auth) recordRecentRequest(now time.Time, success bool) {
 		return
 	}
 	bucket.failed++
+}
+
+func (a *Auth) recordRecentOverload(now time.Time) {
+	if a == nil || now.IsZero() {
+		return
+	}
+	ring := &a.recentOverloads
+	ring.times[ring.next] = now
+	ring.next = (ring.next + 1) % recentOverloadRingCapacity
+	if ring.count < recentOverloadRingCapacity {
+		ring.count++
+	}
+}
+
+// overloadScorePenalty returns how many quota-aware score points this credential
+// should lose because of recent capacity rejections. Zero once the window expires.
+func (a *Auth) overloadScorePenalty(now time.Time) float64 {
+	if a == nil || now.IsZero() {
+		return 0
+	}
+	cutoff := now.Add(-recentOverloadWindow)
+	penalty := 0.0
+	for i := 0; i < a.recentOverloads.count; i++ {
+		at := a.recentOverloads.times[i]
+		if at.After(cutoff) {
+			penalty += recentOverloadPenalty
+		}
+	}
+	if penalty > recentOverloadPenaltyCap {
+		return recentOverloadPenaltyCap
+	}
+	return penalty
 }
 
 func (a *Auth) RecentRequestsSnapshot(now time.Time) []RecentRequestBucket {
